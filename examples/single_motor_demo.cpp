@@ -1,4 +1,5 @@
 #include "damiao_arm_sdk/can_transport.hpp"
+#include "damiao_arm_sdk/damiao_usb_transport.hpp"
 #include "damiao_arm_sdk/motor_driver.hpp"
 #include "damiao_arm_sdk/types.hpp"
 
@@ -25,7 +26,7 @@ void printState(const MotorState& st) {
               << "[Feedback] valid=" << (st.valid ? "yes" : "no")
               << " | id=0x" << std::hex << static_cast<int>(st.slave_id) << std::dec
               << " | status=" << toString(st.error)
-              << " | pos=" << st.position << " rad"
+              << " | pos=" << st.position << " rad (" << (st.position * 180.0f / 3.14159265f) << " deg)"
               << " | vel=" << st.velocity << " rad/s"
               << " | tau=" << st.torque << " Nm"
               << " | T_mos=" << static_cast<int>(st.temp_mos) << "C"
@@ -33,115 +34,126 @@ void printState(const MotorState& st) {
               << " | rx=" << st.rx_count
               << std::endl;
 }
+
+// Safe status refresh frame (CAN ID = 0x7FF, byte[0]=can_id, byte[2]=0xCC)
+void requestStatusRefresh(ICanTransport& transport, uint16_t can_id) {
+    CanFrame f;
+    f.can_id = 0x7FF;
+    f.dlc = 8;
+    f.data = {static_cast<uint8_t>(can_id & 0xFF),
+              static_cast<uint8_t>((can_id >> 8) & 0xFF),
+              0xCC, 0x00, 0x00, 0x00, 0x00, 0x00};
+    transport.send(f);
+}
 } // namespace
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, sigHandler);
+    std::signal(SIGTERM, sigHandler);
 
-    std::string can_if = "vcan0";
+    std::string transport_type = "socketcan"; // "socketcan" or "serial"
+    std::string device_name = "vcan0";
     uint16_t can_id = 0x01;
     uint16_t master_id = 0x11;
-    bool simulate_responder = true;
+    bool probe_only = false;
+    bool hold_current_pos = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--interface" && i + 1 < argc) {
-            can_if = argv[++i];
+            device_name = argv[++i];
+            transport_type = "socketcan";
+        } else if ((arg == "--serial" || arg == "--usb") && i + 1 < argc) {
+            device_name = argv[++i];
+            transport_type = "serial";
         } else if (arg == "--can-id" && i + 1 < argc) {
             can_id = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0));
         } else if (arg == "--master-id" && i + 1 < argc) {
             master_id = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0));
-        } else if (arg == "--real-hw") {
-            simulate_responder = false;
+        } else if (arg == "--probe" || arg == "--monitor") {
+            probe_only = true;
+        } else if (arg == "--hold") {
+            hold_current_pos = true;
         }
     }
 
-    std::cout << "=== Damiao J4310 (24V) Single Motor Demo ===" << std::endl;
-    std::cout << "Interface: " << can_if
+    std::cout << "=== Damiao J4310 (24V) Motor Controller ===" << std::endl;
+    std::cout << "Transport: " << transport_type << " (" << device_name << ")"
               << " | CAN ID: 0x" << std::hex << can_id
-              << " | Master ID: 0x" << master_id << std::dec
-              << " | Simulated Responder: " << (simulate_responder ? "ON" : "OFF") << std::endl;
+              << " | Master ID: 0x" << master_id << std::dec << std::endl;
 
-    auto transport = std::make_shared<SocketCanTransport>(can_if, true);
+    std::shared_ptr<ICanTransport> transport;
+    if (transport_type == "serial") {
+        transport = std::make_shared<DamiaoUsbCanTransport>(device_name, 921600);
+    } else {
+        transport = std::make_shared<SocketCanTransport>(device_name, true);
+    }
+
     MotorConfig config = MotorConfig::J4310(can_id, master_id, ControlMode::MIT);
     MotorDriver motor(transport, config);
 
-    // Optional virtual motor responder thread when testing on vcan0
-    std::thread sim_thread;
-    if (simulate_responder) {
-        sim_thread = std::thread([can_if, config]() {
-            SocketCanTransport sim_can(can_if, true);
-            bool enabled = false;
-            float sim_pos = 0.0f;
-            float sim_vel = 0.0f;
-            float sim_tau = 0.0f;
+    // 1. Send passive status query
+    std::cout << "\n[1] Querying motor status (passive 0x7FF refresh frame, NO motion)..." << std::endl;
+    requestStatusRefresh(*transport, can_id);
+    for (int i = 0; i < 10; ++i) {
+        if (motor.pollFeedback(50)) break;
+    }
 
-            while (g_running) {
-                CanFrame rx;
-                if (!sim_can.receive(rx, 20)) {
-                    continue;
-                }
-                if (rx.can_id != config.can_id &&
-                    rx.can_id != (0x100u + config.can_id) &&
-                    rx.can_id != (0x200u + config.can_id)) {
-                    continue;
-                }
-                if (rx.dlc == 8 && rx.data[0] == 0xFF && rx.data[6] == 0xFF) {
-                    if (rx.data[7] == 0xFC) enabled = true;
-                    else if (rx.data[7] == 0xFD) enabled = false;
-                } else if (rx.can_id == config.can_id && rx.dlc == 8) {
-                    uint16_t p_int = (static_cast<uint16_t>(rx.data[0]) << 8) | rx.data[1];
-                    uint16_t v_int = (static_cast<uint16_t>(rx.data[2]) << 4) | (rx.data[3] >> 4);
-                    uint16_t t_int = (static_cast<uint16_t>(rx.data[6] & 0x0F) << 8) | rx.data[7];
-                    sim_pos = protocol::uintToFloat(p_int, -config.limits.p_max, config.limits.p_max, 16);
-                    sim_vel = protocol::uintToFloat(v_int, -config.limits.v_max, config.limits.v_max, 12);
-                    sim_tau = protocol::uintToFloat(t_int, -config.limits.t_max, config.limits.t_max, 12);
-                }
+    MotorState initial_state = motor.getState();
+    if (!initial_state.valid) {
+        std::cerr << "[ERROR] No response received from motor! Please check wiring, power (24V), and CAN IDs." << std::endl;
+        return 1;
+    }
+    printState(initial_state);
 
-                // Reply with feedback frame on master_id
-                CanFrame fb;
-                fb.can_id = config.master_id;
-                fb.dlc = 8;
-                uint8_t status = enabled ? static_cast<uint8_t>(MotorError::ENABLED)
-                                         : static_cast<uint8_t>(MotorError::DISABLED);
-                uint16_t p_u = protocol::floatToUint(sim_pos, -config.limits.p_max, config.limits.p_max, 16);
-                uint16_t v_u = protocol::floatToUint(sim_vel, -config.limits.v_max, config.limits.v_max, 12);
-                uint16_t t_u = protocol::floatToUint(sim_tau, -config.limits.t_max, config.limits.t_max, 12);
-
-                fb.data[0] = static_cast<uint8_t>((status << 4) | (config.can_id & 0x0F));
-                fb.data[1] = static_cast<uint8_t>((p_u >> 8) & 0xFF);
-                fb.data[2] = static_cast<uint8_t>(p_u & 0xFF);
-                fb.data[3] = static_cast<uint8_t>((v_u >> 4) & 0xFF);
-                fb.data[4] = static_cast<uint8_t>(((v_u & 0x0F) << 4) | ((t_u >> 8) & 0x0F));
-                fb.data[5] = static_cast<uint8_t>(t_u & 0xFF);
-                fb.data[6] = 29;
-                fb.data[7] = 31;
-                sim_can.send(fb);
+    if (probe_only) {
+        std::cout << "\n[Monitor Mode] Continuous passive polling (Ctrl+C to quit)..." << std::endl;
+        while (g_running) {
+            requestStatusRefresh(*transport, can_id);
+            if (motor.pollFeedback(50)) {
+                printState(motor.getState());
             }
-        });
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return 0;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // 2. Safe drive test
+    float initial_pos = initial_state.position;
+    std::cout << "\n[2] Initial position: " << initial_pos << " rad ("
+              << (initial_pos * 180.0f / 3.14159265f) << " deg)" << std::endl;
 
-    std::cout << "\n1) Enabling motor..." << std::endl;
+    std::cout << "[3] Enabling motor..." << std::endl;
     motor.enable();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     motor.pollFeedback(50);
     printState(motor.getState());
 
-    std::cout << "\n2) Sending MIT control commands (pos=0.5 rad, vel=1.0 rad/s, kp=20, kd=1.0, tau=0.2 Nm)..." << std::endl;
-    motor.setMIT(0.5f, 1.0f, 20.0f, 1.0f, 0.2f);
-    motor.pollFeedback(50);
-    printState(motor.getState());
-
-    std::cout << "\n3) Disabling motor..." << std::endl;
-    motor.disable();
-    motor.pollFeedback(50);
-    printState(motor.getState());
-
-    g_running = false;
-    if (sim_thread.joinable()) {
-        sim_thread.join();
+    if (hold_current_pos) {
+        std::cout << "\n[4] Safe Position Hold: holding current position " << initial_pos
+                  << " rad with gentle stiffness (Kp=5.0, Kd=0.5)..." << std::endl;
+        for (int i = 0; i < 50 && g_running; ++i) {
+            motor.setMIT(initial_pos, 0.0f, 5.0f, 0.5f, 0.0f);
+            motor.pollFeedback(20);
+            if (i % 10 == 0) printState(motor.getState());
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    } else {
+        std::cout << "\n[4] Safe Damping Mode: zero torque, gentle damping (Kp=0.0, Kd=0.5)..." << std::endl;
+        for (int i = 0; i < 50 && g_running; ++i) {
+            motor.setMIT(0.0f, 0.0f, 0.0f, 0.5f, 0.0f);
+            motor.pollFeedback(20);
+            if (i % 10 == 0) printState(motor.getState());
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
     }
-    transport->close();
+
+    std::cout << "\n[5] Disabling motor..." << std::endl;
+    motor.disable();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    motor.pollFeedback(50);
+    printState(motor.getState());
+
+    std::cout << "\n[Done] Motor safely disabled." << std::endl;
     return 0;
 }

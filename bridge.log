@@ -1,0 +1,5 @@
+=== Damiao USB-CAN <-> Linux SocketCAN Bridge ===
+SocketCAN Interface: vcan0
+USB-CAN Serial Port: /dev/ttyACM0 @921600
+Bridge running. Press Ctrl+C to terminate.
+Bridge stopped. Total forwarded: SocketCAN->USB: 1, USB->SocketCAN: 0

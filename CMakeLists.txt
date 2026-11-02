@@ -9,6 +9,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(damiao_arm_sdk STATIC
     src/can_transport.cpp
+    src/damiao_usb_transport.cpp
     src/motor_driver.cpp
 )
 
@@ -24,6 +25,10 @@ target_link_libraries(damiao_arm_sdk PUBLIC Threads::Threads)
 # Single-motor demo executable
 add_executable(single_motor_demo examples/single_motor_demo.cpp)
 target_link_libraries(single_motor_demo PRIVATE damiao_arm_sdk)
+
+# SocketCAN <-> Damiao USB-CAN bridge daemon
+add_executable(damiao_socketcan_bridge examples/damiao_socketcan_bridge.cpp)
+target_link_libraries(damiao_socketcan_bridge PRIVATE damiao_arm_sdk)
 
 # Unit & vcan0 integration tests
 enable_testing()
