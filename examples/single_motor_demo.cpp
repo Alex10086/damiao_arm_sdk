@@ -35,7 +35,7 @@ void printState(const MotorState& st) {
               << std::endl;
 }
 
-// Safe status refresh frame (CAN ID = 0x7FF, byte[0]=can_id, byte[2]=0xCC)
+// Safe passive status refresh frame (CAN ID = 0x7FF, byte[0]=can_id, byte[2]=0xCC)
 void requestStatusRefresh(ICanTransport& transport, uint16_t can_id) {
     CanFrame f;
     f.can_id = 0x7FF;
@@ -55,8 +55,10 @@ int main(int argc, char** argv) {
     std::string device_name = "vcan0";
     uint16_t can_id = 0x01;
     uint16_t master_id = 0x11;
-    bool probe_only = false;
+    // P0 Safety Fix: Default is read-only probe (NO motor enable unless --enable or --hold is explicitly passed)
+    bool enable_drive = false;
     bool hold_current_pos = false;
+    bool continuous_monitor = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -70,9 +72,14 @@ int main(int argc, char** argv) {
             can_id = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0));
         } else if (arg == "--master-id" && i + 1 < argc) {
             master_id = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0));
-        } else if (arg == "--probe" || arg == "--monitor") {
-            probe_only = true;
+        } else if (arg == "--monitor") {
+            continuous_monitor = true;
+        } else if (arg == "--probe") {
+            enable_drive = false;
+        } else if (arg == "--enable") {
+            enable_drive = true;
         } else if (arg == "--hold") {
+            enable_drive = true;
             hold_current_pos = true;
         }
     }
@@ -80,7 +87,9 @@ int main(int argc, char** argv) {
     std::cout << "=== Damiao J4310 (24V) Motor Controller ===" << std::endl;
     std::cout << "Transport: " << transport_type << " (" << device_name << ")"
               << " | CAN ID: 0x" << std::hex << can_id
-              << " | Master ID: 0x" << master_id << std::dec << std::endl;
+              << " | Master ID: 0x" << master_id << std::dec
+              << " | Mode: " << (enable_drive ? (hold_current_pos ? "ENABLE+HOLD" : "ENABLE+DAMPING") : "READ-ONLY PROBE (Safe Default)")
+              << std::endl;
 
     std::shared_ptr<ICanTransport> transport;
     if (transport_type == "serial") {
@@ -106,19 +115,23 @@ int main(int argc, char** argv) {
     }
     printState(initial_state);
 
-    if (probe_only) {
-        std::cout << "\n[Monitor Mode] Continuous passive polling (Ctrl+C to quit)..." << std::endl;
-        while (g_running) {
-            requestStatusRefresh(*transport, can_id);
-            if (motor.pollFeedback(50)) {
-                printState(motor.getState());
+    if (!enable_drive) {
+        if (continuous_monitor) {
+            std::cout << "\n[Monitor Mode] Continuous passive polling (Ctrl+C to quit)..." << std::endl;
+            while (g_running) {
+                requestStatusRefresh(*transport, can_id);
+                if (motor.pollFeedback(50)) {
+                    printState(motor.getState());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        } else {
+            std::cout << "\n[Safe Default] Read-only probe finished. Pass --enable or --hold to actively enable motor." << std::endl;
         }
         return 0;
     }
 
-    // 2. Safe drive test
+    // 2. Explicit active drive test (--enable or --hold required)
     float initial_pos = initial_state.position;
     std::cout << "\n[2] Initial position: " << initial_pos << " rad ("
               << (initial_pos * 180.0f / 3.14159265f) << " deg)" << std::endl;

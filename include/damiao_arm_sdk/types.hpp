@@ -65,8 +65,11 @@ inline MotorError parseMotorError(uint8_t raw_nibble) noexcept {
     }
 }
 
+// ProtocolLimits: Full-scale mapping range configured in motor registers (PMAX, VMAX, TMAX).
+// NOTE: This is the protocol quantization mapping span (used for float <-> uint16/uint12 conversion
+// in MIT mode and feedback decoding), NOT the physical joint mechanical travel limit!
 struct ProtocolLimits {
-    float p_max{12.5f};   // rad
+    float p_max{12.5f};   // rad   (protocol mapping span [-p_max, +p_max])
     float v_max{30.0f};   // rad/s (J4310 24V default)
     float t_max{10.0f};   // N*m   (J4310 24V default)
     float kp_min{0.0f};
@@ -97,14 +100,36 @@ struct ProtocolLimits {
     }
 };
 
+// CommandLimits: Optional user/mechanical safety limits (distinct from ProtocolLimits).
+// Physical joint position limits (e.g., [-3.14, 3.14] rad for a joint or [0, 0.8] rad for a gripper)
+// or POS_VEL multi-turn limits can be enforced independently of the protocol quantization span.
+struct CommandLimits {
+    float pos_min{-12.5f}; // rad
+    float pos_max{12.5f};  // rad
+    float vel_max{30.0f};  // rad/s
+    float tau_max{10.0f};  // N*m
+
+    static constexpr CommandLimits fromProtocol(const ProtocolLimits& p) noexcept {
+        return CommandLimits{-p.p_max, p.p_max, p.v_max, p.t_max};
+    }
+
+    bool isValid() const noexcept {
+        return std::isfinite(pos_min) && std::isfinite(pos_max) && pos_max >= pos_min &&
+               std::isfinite(vel_max) && vel_max > 0.0f &&
+               std::isfinite(tau_max) && tau_max > 0.0f;
+    }
+};
+
 struct MotorConfig {
     MotorModel model{MotorModel::DM_J4310_2EC};
-    uint16_t can_id{0x01};      // Slave CAN ID (1 ~ 0x7F, standard 11-bit ID with mode offset up to 0x2FF)
-    uint16_t master_id{0x11};   // Master / feedback CAN ID (0x00 ~ 0x7FF)
+    uint16_t can_id{0x01};      // Slave CAN ID (1 ~ 0xFF)
+    uint16_t master_id{0x11};   // Master / feedback CAN ID (0x00 ~ 0x7FF, recommend can_id + 0x10)
     ControlMode mode{ControlMode::MIT};
     ProtocolLimits limits{ProtocolLimits::forModel(MotorModel::DM_J4310_2EC)};
+    CommandLimits cmd_limits{CommandLimits::fromProtocol(ProtocolLimits::forModel(MotorModel::DM_J4310_2EC))};
     uint32_t state_timeout_ms{500}; // Feedback staleness threshold in ms
-    bool strict_range_check{false}; // If true, out-of-range inputs throw instead of clamping
+    bool strict_range_check{true};  // P1: Default true (throw std::out_of_range on invalid command range)
+    bool special_cmd_use_mode_offset{true}; // P0: true = mode_offset + can_id; false = raw can_id (new firmware)
 
     static MotorConfig J4310(uint16_t can_id,
                              uint16_t master_id,
@@ -115,6 +140,8 @@ struct MotorConfig {
         cfg.master_id = master_id;
         cfg.mode = mode;
         cfg.limits = ProtocolLimits::forModel(MotorModel::DM_J4310_2EC);
+        cfg.cmd_limits = CommandLimits::fromProtocol(cfg.limits);
+        cfg.strict_range_check = true;
         return cfg;
     }
 
@@ -132,11 +159,14 @@ struct MotorConfig {
         if (!limits.isValid()) {
             throw std::invalid_argument("MotorConfig: invalid protocol limits");
         }
+        if (!cmd_limits.isValid()) {
+            throw std::invalid_argument("MotorConfig: invalid command limits");
+        }
     }
 };
 
 struct MotorState {
-    uint8_t slave_id{0};            // 4-bit ID from feedback byte[0] low nibble
+    uint16_t slave_id{0};           // Full slave ID (resolved from config if can_id > 0x0F, or 8-bit byte[0] if master_id != 0)
     uint8_t raw_status{0};          // 4-bit status from feedback byte[0] high nibble
     MotorError error{MotorError::DISABLED};
     float position{0.0f};           // rad

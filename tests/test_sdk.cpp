@@ -44,9 +44,8 @@ int g_failed = 0;
         EXPECT_TRUE(caught, msg);                                                     \
     } while (0)
 
-// Helper to build a raw Damiao feedback frame as a motor would send it
 CanFrame buildMockFeedbackFrame(uint16_t master_id,
-                                uint8_t slave_id,
+                                uint8_t slave_id_nibble,
                                 MotorError status,
                                 float pos,
                                 float vel,
@@ -62,10 +61,10 @@ CanFrame buildMockFeedbackFrame(uint16_t master_id,
     uint16_t v_int = protocol::floatToUint(vel, -limits.v_max, limits.v_max, 12);
     uint16_t t_int = protocol::floatToUint(tau, -limits.t_max, limits.t_max, 12);
 
-    frame.data[0] = static_cast<uint8_t>(((static_cast<uint8_t>(status) & 0x0F) << 4) | (slave_id & 0x0F));
-    frame.data[1] = static_cast<uint8_t>((p_int >> 8) & 0xFF);
-    frame.data[2] = static_cast<uint8_t>(p_int & 0xFF);
-    frame.data[3] = static_cast<uint8_t>((v_int >> 4) & 0xFF);
+    frame.data[0] = static_cast<uint8_t>(((static_cast<uint8_t>(status) & 0x0F) << 4) | (slave_id_nibble & 0x0F));
+    frame.data[1] = static_cast<uint16_t>(p_int >> 8) & 0xFF;
+    frame.data[2] = static_cast<uint16_t>(p_int) & 0xFF;
+    frame.data[3] = static_cast<uint16_t>(v_int >> 4) & 0xFF;
     frame.data[4] = static_cast<uint8_t>(((v_int & 0x0F) << 4) | ((t_int >> 8) & 0x0F));
     frame.data[5] = static_cast<uint8_t>(t_int & 0xFF);
     frame.data[6] = t_mos;
@@ -77,7 +76,6 @@ void testProtocolCodec() {
     std::cout << "[TEST] Protocol Codec (J4310 24V MIT / POS_VEL / VEL / State Cmds)..." << std::endl;
     const auto limits = ProtocolLimits::forModel(MotorModel::DM_J4310_2EC);
 
-    // 1. Enable / Disable / SaveZero / ClearError frames
     auto en_frame = protocol::encodeEnableFrame(0x01);
     EXPECT_TRUE(en_frame.can_id == 0x01 && en_frame.dlc == 8, "Enable CAN ID & DLC");
     EXPECT_TRUE(en_frame.data[0] == 0xFF && en_frame.data[7] == 0xFC, "Enable payload 0xFC");
@@ -91,7 +89,6 @@ void testProtocolCodec() {
     auto clr_frame = protocol::encodeClearErrorFrame(0x01);
     EXPECT_TRUE(clr_frame.data[7] == 0xFB, "ClearError payload 0xFB");
 
-    // 2. MIT encoding & bit-unpacking verification
     float target_pos = 1.57f;
     float target_vel = -5.2f;
     float target_kp  = 45.0f;
@@ -113,7 +110,6 @@ void testProtocolCodec() {
     EXPECT_NEAR(protocol::uintToFloat(kd_int, limits.kd_min, limits.kd_max, 12), target_kd, 2e-3f, "MIT kd roundtrip");
     EXPECT_NEAR(protocol::uintToFloat(t_int, -limits.t_max, limits.t_max, 12), target_tau, 1e-2f, "MIT tau roundtrip");
 
-    // 3. POS_VEL encoding verification (CAN ID = 0x100 + id, 2 IEEE-754 floats)
     auto pv_frame = protocol::encodePosVelFrame(0x02, -3.14159f, 8.5f, limits);
     EXPECT_TRUE(pv_frame.can_id == 0x102 && pv_frame.dlc == 8, "POS_VEL CAN ID == 0x102, DLC == 8");
     float decoded_pos = 0.0f, decoded_vel = 0.0f;
@@ -122,7 +118,6 @@ void testProtocolCodec() {
     EXPECT_NEAR(decoded_pos, -3.14159f, 1e-6f, "POS_VEL pos float32 exact");
     EXPECT_NEAR(decoded_vel, 8.5f, 1e-6f, "POS_VEL vel float32 exact");
 
-    // 4. VEL encoding verification (CAN ID = 0x200 + id, 1 IEEE-754 float)
     auto vel_frame = protocol::encodeVelFrame(0x03, -12.75f, limits);
     EXPECT_TRUE(vel_frame.can_id == 0x203 && vel_frame.dlc == 4, "VEL CAN ID == 0x203, DLC == 4");
     float decoded_vonly = 0.0f;
@@ -130,8 +125,8 @@ void testProtocolCodec() {
     EXPECT_NEAR(decoded_vonly, -12.75f, 1e-6f, "VEL float32 exact");
 }
 
-void testFeedbackParsing() {
-    std::cout << "[TEST] Feedback Parsing (Position / Velocity / Torque / Fault Codes / Temps)..." << std::endl;
+void testFeedbackParsingAndHighCanId() {
+    std::cout << "[TEST] Feedback Parsing & High CAN ID (> 15) Matching..." << std::endl;
     const auto limits = ProtocolLimits::forModel(MotorModel::DM_J4310_2EC);
 
     auto fb = buildMockFeedbackFrame(0x11, 0x01, MotorError::ENABLED, -2.5f, 6.0f, -1.8f, 34, 41, limits);
@@ -145,37 +140,84 @@ void testFeedbackParsing() {
     EXPECT_NEAR(state.torque, -1.8f, 1e-2f, "Feedback torque accuracy");
     EXPECT_TRUE(state.temp_mos == 34 && state.temp_rotor == 41, "Feedback temperatures");
 
-    // Fault code parsing (e.g., 0xC = Coil Overtemperature)
     auto fault_fb = buildMockFeedbackFrame(0x11, 0x01, MotorError::COIL_OVERTEMP, 0.0f, 0.0f, 0.0f, 45, 102, limits);
     MotorState fault_state = protocol::decodeFeedbackFrame(fault_fb, limits, state.rx_count);
     EXPECT_TRUE(fault_state.hasFault(), "Fault state detected");
     EXPECT_TRUE(fault_state.error == MotorError::COIL_OVERTEMP, "Fault code COIL_OVERTEMP (0xC)");
     EXPECT_TRUE(fault_state.rx_count == 2, "RX counter incremented");
+
+    // P1 Test: CAN ID > 15 (e.g. can_id = 0x15 = 21, master_id = 0x25), where firmware puts non-matching 4-bit value or truncated ID in byte[0]
+    auto transport = std::make_shared<SocketCanTransport>();
+    MotorConfig cfg_high = MotorConfig::J4310(0x15, 0x25, ControlMode::MIT);
+    MotorDriver driver_high(transport, cfg_high);
+
+    CanFrame high_id_fb = buildMockFeedbackFrame(0x25, 0x00, MotorError::ENABLED, 1.25f, 0.0f, 0.0f, 28, 29, limits);
+    EXPECT_TRUE(driver_high.processFeedbackFrame(high_id_fb), "Feedback matched via unique master_id when can_id > 15");
+    EXPECT_TRUE(driver_high.getState().slave_id == 0x15, "Resolved full slave_id (0x15) stored in MotorState");
+}
+
+void testP0AndP1Fixes() {
+    std::cout << "[TEST] P0 & P1 Fixes (Mode Check / Special Cmd ID / Default Strict Check / CommandLimits)..." << std::endl;
+    auto tx_transport = std::make_shared<SocketCanTransport>("vcan0", true);
+    auto rx_transport = std::make_shared<SocketCanTransport>("vcan0", true);
+
+    // 1. P0: Control mode mismatch checks
+    MotorConfig mit_cfg = MotorConfig::J4310(0x01, 0x11, ControlMode::MIT);
+    MotorDriver mit_driver(tx_transport, mit_cfg);
+    EXPECT_THROW(mit_driver.setPosVel(1.0f, 1.0f), std::logic_error, "setPosVel throws when configured in MIT mode");
+    EXPECT_THROW(mit_driver.setVelocity(1.0f), std::logic_error, "setVelocity throws when configured in MIT mode");
+
+    MotorConfig pv_cfg = MotorConfig::J4310(0x02, 0x12, ControlMode::POS_VEL);
+    MotorDriver pv_driver(tx_transport, pv_cfg);
+    EXPECT_THROW(pv_driver.setMIT(0.0f, 0.0f, 1.0f, 0.1f, 0.0f), std::logic_error, "setMIT throws when configured in POS_VEL mode");
+
+    // 2. P0: Special command CAN ID mode compatibility (with and without mode offset)
+    EXPECT_TRUE(pv_driver.specialCommandCanId() == 0x102, "Default specialCommandCanId includes mode offset (0x102)");
+    pv_driver.enable();
+    CanFrame wire_frame;
+    EXPECT_TRUE(rx_transport->receive(wire_frame, 50) && wire_frame.can_id == 0x102, "POS_VEL enable uses 0x102 by default");
+
+    MotorConfig pv_raw_id_cfg = pv_cfg;
+    pv_raw_id_cfg.special_cmd_use_mode_offset = false;
+    MotorDriver pv_raw_driver(tx_transport, pv_raw_id_cfg);
+    EXPECT_TRUE(pv_raw_driver.specialCommandCanId() == 0x02, "special_cmd_use_mode_offset=false uses raw can_id (0x02)");
+    pv_raw_driver.enable();
+    EXPECT_TRUE(rx_transport->receive(wire_frame, 50) && wire_frame.can_id == 0x02, "POS_VEL enable uses raw 0x02 when configured");
+
+    // 3. P1: strict_range_check is enabled by default
+    EXPECT_TRUE(mit_cfg.strict_range_check == true, "MotorConfig::strict_range_check defaults to true");
+    EXPECT_THROW(mit_driver.setMIT(20.0f, 0.0f, 1.0f, 0.1f, 0.0f), std::out_of_range, "Default strict_range_check throws on pos > 12.5");
+
+    // 4. P1: Distinction between ProtocolLimits (mapping span) and CommandLimits (physical travel / multi-turn)
+    MotorConfig joint_cfg = MotorConfig::J4310(0x01, 0x11, ControlMode::MIT);
+    joint_cfg.cmd_limits.pos_min = -1.57f; // Physical joint limit [-90 deg, +90 deg]
+    joint_cfg.cmd_limits.pos_max = 1.57f;
+    MotorDriver joint_driver(tx_transport, joint_cfg);
+    // 2.0 rad is within ProtocolLimits (12.5 rad) but exceeds physical joint CommandLimits (1.57 rad)
+    EXPECT_THROW(joint_driver.setMIT(2.0f, 0.0f, 10.0f, 0.5f, 0.0f), std::out_of_range,
+                 "Physical CommandLimits [-1.57, 1.57] enforced even when inside ProtocolLimits [-12.5, 12.5]");
 }
 
 void testExceptionsAndEdgeCases() {
     std::cout << "[TEST] Exception Handling (Invalid Params / Comm Failures / Invalid & Stale Feedback)..." << std::endl;
     const auto limits = ProtocolLimits::forModel(MotorModel::DM_J4310_2EC);
 
-    // 1. Invalid parameters (NaN / Inf / out-of-range in strict mode / bad MotorConfig)
     EXPECT_THROW(protocol::encodeMITFrame(0x01, std::nanf(""), 0.0f, 1.0f, 0.1f, 0.0f, limits),
                  std::invalid_argument, "NaN position rejected");
-    EXPECT_THROW(protocol::encodeMITFrame(0x01, 20.0f, 0.0f, 1.0f, 0.1f, 0.0f, limits, true),
-                 std::out_of_range, "Out-of-range pos rejected in strict mode");
-    EXPECT_THROW(protocol::encodePosVelFrame(0x01, 0.0f, 50.0f, limits, true),
-                 std::out_of_range, "Out-of-range vel rejected in strict mode");
+    EXPECT_THROW(protocol::encodeMITFrame(0x01, 20.0f, 0.0f, 1.0f, 0.1f, 0.0f, limits),
+                 std::out_of_range, "Out-of-range pos rejected by default in encodeMITFrame");
+    EXPECT_THROW(protocol::encodePosVelFrame(0x01, 0.0f, 50.0f, limits),
+                 std::out_of_range, "Out-of-range vel rejected by default in encodePosVelFrame");
 
     MotorConfig bad_cfg = MotorConfig::J4310(0x00, 0x11);
     EXPECT_THROW(bad_cfg.validate(), std::invalid_argument, "can_id == 0 rejected");
 
-    // 2. Communication failures (unopened socket, non-existent interface)
     SocketCanTransport unopened_can;
     CanFrame dummy;
     EXPECT_THROW(unopened_can.send(dummy), CanException, "Send on closed transport throws CanException");
     EXPECT_THROW(unopened_can.receive(dummy, 5), CanException, "Receive on closed transport throws CanException");
     EXPECT_THROW(unopened_can.open("nonexistent_can99"), CanException, "Open invalid interface throws CanException");
 
-    // 3. Invalid feedback frame (wrong DLC, RTR, error flag)
     CanFrame short_frame;
     short_frame.can_id = 0x11;
     short_frame.dlc = 5;
@@ -189,13 +231,11 @@ void testExceptionsAndEdgeCases() {
     EXPECT_THROW(protocol::decodeFeedbackFrame(err_frame, limits),
                  std::invalid_argument, "Error flag frame rejected");
 
-    // 4. Stale / missing feedback detection in MotorDriver
     auto transport = std::make_shared<SocketCanTransport>();
     MotorConfig cfg = MotorConfig::J4310(0x01, 0x11);
     cfg.state_timeout_ms = 30;
     MotorDriver driver(transport, cfg);
 
-    // Before any feedback arrives, check_staleness=true must throw
     EXPECT_THROW(driver.getState(true), CanException, "getState(true) throws when no feedback received yet");
 
     auto fb = buildMockFeedbackFrame(0x11, 0x01, MotorError::ENABLED, 1.0f, 0.0f, 0.0f, 28, 30, cfg.limits);
@@ -218,20 +258,17 @@ void testVcan0Communication() {
     MotorConfig cfg = MotorConfig::J4310(0x01, 0x11, ControlMode::MIT);
     MotorDriver driver(tx_transport, cfg);
 
-    // 1. Driver sends Enable -> RX endpoint receives on vcan0
     driver.enable();
     CanFrame wire_frame;
     bool got_en = rx_transport->receive(wire_frame, 100);
     EXPECT_TRUE(got_en && wire_frame.can_id == 0x01 && wire_frame.data[7] == 0xFC,
                 "vcan0 received Enable frame from MotorDriver");
 
-    // 2. Driver sends MIT command -> RX endpoint receives on vcan0
     driver.setMIT(0.8f, 1.5f, 25.0f, 0.8f, 0.5f);
     bool got_mit = rx_transport->receive(wire_frame, 100);
     EXPECT_TRUE(got_mit && wire_frame.can_id == 0x01 && wire_frame.dlc == 8,
                 "vcan0 received MIT frame from MotorDriver");
 
-    // 3. Simulated motor on rx_transport sends feedback -> MotorDriver polls and updates state
     CanFrame mock_fb = buildMockFeedbackFrame(
         0x11, 0x01, MotorError::ENABLED, 0.79f, 1.48f, 0.49f, 31, 33, cfg.limits);
     rx_transport->send(mock_fb);
@@ -251,7 +288,8 @@ void testVcan0Communication() {
 
 int main() {
     testProtocolCodec();
-    testFeedbackParsing();
+    testFeedbackParsingAndHighCanId();
+    testP0AndP1Fixes();
     testExceptionsAndEdgeCases();
     testVcan0Communication();
 

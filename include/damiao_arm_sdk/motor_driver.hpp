@@ -26,18 +26,18 @@ CanFrame encodeMITFrame(uint16_t can_id,
                         float kd,
                         float tau,
                         const ProtocolLimits& limits,
-                        bool strict_range_check = false);
+                        bool strict_range_check = true);
 
 CanFrame encodePosVelFrame(uint16_t can_id,
                            float pos,
                            float vel,
                            const ProtocolLimits& limits,
-                           bool strict_range_check = false);
+                           bool strict_range_check = true);
 
 CanFrame encodeVelFrame(uint16_t can_id,
                         float vel,
                         const ProtocolLimits& limits,
-                        bool strict_range_check = false);
+                        bool strict_range_check = true);
 
 // Decodes an 8-byte Damiao motor feedback frame into state.
 // Throws std::invalid_argument if frame DLC != 8 or frame is error/RTR.
@@ -52,13 +52,13 @@ class MotorDriver {
 public:
     MotorDriver(std::shared_ptr<ICanTransport> transport, const MotorConfig& config);
 
-    // State commands
+    // State commands (use specialCommandCanId() for mode compatibility)
     void enable();
     void disable();
     void saveZeroPosition();
     void clearError();
 
-    // Control mode commands
+    // Control mode commands (enforce config_.mode match & config_.cmd_limits)
     void setMIT(float pos, float vel, float kp, float kd, float tau);
     void setPosVel(float pos, float vel);
     void setVelocity(float vel);
@@ -75,6 +75,7 @@ public:
 
     const MotorConfig& config() const noexcept { return config_; }
     uint32_t activeTxCanId() const noexcept;
+    uint32_t specialCommandCanId() const noexcept;
 
 private:
     std::shared_ptr<ICanTransport> transport_;
