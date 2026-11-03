@@ -1,0 +1,3 @@
+[submodule "third_party/openarm_can"]
+	path = third_party/openarm_can
+	url = https://github.com/enactic/openarm_can.git

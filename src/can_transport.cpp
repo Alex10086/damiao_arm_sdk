@@ -38,10 +38,20 @@ void SocketCanTransport::open(const std::string& interface_name) {
     }
 
     int loopback_opt = loopback_ ? 1 : 0;
-    ::setsockopt(fd, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &loopback_opt, sizeof(loopback_opt));
+    if (::setsockopt(fd, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &loopback_opt, sizeof(loopback_opt)) < 0) {
+        int err = errno;
+        ::close(fd);
+        throw CanException("SocketCanTransport::open: setsockopt(CAN_RAW_LOOPBACK) failed: " +
+                           std::string(std::strerror(err)));
+    }
 
     int recv_own_opt = recv_own_msgs_ ? 1 : 0;
-    ::setsockopt(fd, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own_opt, sizeof(recv_own_opt));
+    if (::setsockopt(fd, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own_opt, sizeof(recv_own_opt)) < 0) {
+        int err = errno;
+        ::close(fd);
+        throw CanException("SocketCanTransport::open: setsockopt(CAN_RAW_RECV_OWN_MSGS) failed: " +
+                           std::string(std::strerror(err)));
+    }
 
     struct ifreq ifr {};
     std::strncpy(ifr.ifr_name, interface_name.c_str(), IFNAMSIZ - 1);
@@ -112,6 +122,9 @@ void SocketCanTransport::send(const CanFrame& frame) {
     }
     if (fd < 0) {
         throw CanException("SocketCanTransport::send: CAN socket is not open");
+    }
+    if (frame.is_error) {
+        throw std::invalid_argument("SocketCanTransport::send: cannot transmit error frame");
     }
     if (frame.dlc > 8) {
         throw std::invalid_argument("SocketCanTransport::send: invalid DLC (> 8)");
@@ -187,7 +200,10 @@ bool SocketCanTransport::receive(CanFrame& frame, int timeout_ms) {
     frame.is_rtr = (raw.can_id & CAN_RTR_FLAG) != 0;
     frame.is_error = (raw.can_id & CAN_ERR_FLAG) != 0;
     frame.can_id = raw.can_id & (frame.is_extended ? CAN_EFF_MASK : CAN_SFF_MASK);
-    frame.dlc = raw.can_dlc > 8 ? 8 : raw.can_dlc;
+    if (raw.can_dlc > 8) {
+        throw CanException("SocketCanTransport::receive: invalid CAN DLC (> 8)");
+    }
+    frame.dlc = raw.can_dlc;
     frame.data.fill(0);
     std::memcpy(frame.data.data(), raw.data, frame.dlc);
     return true;

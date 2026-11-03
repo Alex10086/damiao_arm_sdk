@@ -1,11 +1,9 @@
-#include "damiao_arm_sdk/can_transport.hpp"
-#include "damiao_arm_sdk/damiao_usb_transport.hpp"
+#include "damiao_arm_sdk/socketcan_bridge.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <thread>
 
@@ -15,7 +13,7 @@ namespace {
 std::atomic<bool> g_running{true};
 
 void sigHandler(int) {
-    g_running = false;
+    g_running.store(false, std::memory_order_release);
 }
 } // namespace
 
@@ -23,74 +21,46 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, sigHandler);
     std::signal(SIGTERM, sigHandler);
 
-    std::string socketcan_if = "vcan0";
-    std::string serial_port = "/dev/ttyACM0";
-    int baudrate = 921600;
-
+    BridgeConfig cfg;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--socketcan" && i + 1 < argc) {
-            socketcan_if = argv[++i];
+            cfg.socketcan_if = argv[++i];
         } else if (arg == "--serial" && i + 1 < argc) {
-            serial_port = argv[++i];
+            cfg.serial_port = argv[++i];
         } else if (arg == "--baud" && i + 1 < argc) {
-            baudrate = std::stoi(argv[++i]);
+            cfg.baudrate = std::stoi(argv[++i]);
+        } else if (arg == "--no-reconnect") {
+            cfg.auto_reconnect = false;
+        } else if (arg == "--verbose" || arg == "-v") {
+            cfg.verbose = true;
         }
     }
 
     std::cout << "=== Damiao USB-CAN <-> Linux SocketCAN Bridge ===" << std::endl;
-    std::cout << "SocketCAN Interface: " << socketcan_if << std::endl;
-    std::cout << "USB-CAN Serial Port: " << serial_port << " @" << baudrate << std::endl;
+    std::cout << "SocketCAN Interface: " << cfg.socketcan_if << std::endl;
+    std::cout << "USB-CAN Serial Port: " << cfg.serial_port << " @" << cfg.baudrate << std::endl;
+    std::cout << "Auto Reconnect     : " << (cfg.auto_reconnect ? "enabled" : "disabled") << std::endl;
 
-    auto sock_can = std::make_shared<SocketCanTransport>(socketcan_if, true);
-    auto usb_can = std::make_shared<DamiaoUsbCanTransport>(serial_port, baudrate);
+    try {
+        SocketCanUsbBridge bridge(cfg);
+        bridge.start();
+        std::cout << "Bridge running. Press Ctrl+C to terminate." << std::endl;
 
-    std::atomic<uint64_t> tx_count{0};
-    std::atomic<uint64_t> rx_count{0};
-
-    // Thread 1: SocketCAN (e.g. vcan0) -> USB-CAN (/dev/ttyACM0)
-    std::thread sock_to_usb([sock_can, usb_can, &tx_count]() {
-        CanFrame frame;
-        while (g_running) {
-            if (sock_can->receive(frame, 10)) {
-                try {
-                    usb_can->send(frame);
-                    tx_count++;
-                } catch (const std::exception& e) {
-                    std::cerr << "[Bridge] SocketCAN -> USB error: " << e.what() << std::endl;
-                }
-            }
+        while (g_running.load(std::memory_order_acquire) && bridge.isRunning()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-    });
 
-    // Thread 2: USB-CAN (/dev/ttyACM0) -> SocketCAN (vcan0)
-    std::thread usb_to_sock([sock_can, usb_can, &rx_count]() {
-        CanFrame frame;
-        while (g_running) {
-            if (usb_can->receive(frame, 10)) {
-                try {
-                    sock_can->send(frame);
-                    rx_count++;
-                } catch (const std::exception& e) {
-                    std::cerr << "[Bridge] USB -> SocketCAN error: " << e.what() << std::endl;
-                }
-            }
-        }
-    });
-
-    std::cout << "Bridge running. Press Ctrl+C to terminate." << std::endl;
-
-    while (g_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        bridge.stop();
+        auto st = bridge.getStats();
+        std::cout << "Bridge stopped. Forwarded SocketCAN->USB: " << st.sock_to_usb_forwarded
+                  << ", USB->SocketCAN: " << st.usb_to_sock_forwarded
+                  << " | Dropped(sock/usb): " << st.sock_rx_dropped << "/" << st.usb_rx_dropped
+                  << " | Errors(sock/usb): " << st.sock_errors << "/" << st.usb_errors
+                  << " | Reconnects: " << st.usb_reconnects << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[Bridge Fatal] " << e.what() << std::endl;
+        return 1;
     }
-
-    if (sock_to_usb.joinable()) sock_to_usb.join();
-    if (usb_to_sock.joinable()) usb_to_sock.join();
-
-    sock_can->close();
-    usb_can->close();
-
-    std::cout << "Bridge stopped. Total forwarded: SocketCAN->USB: " << tx_count
-              << ", USB->SocketCAN: " << rx_count << std::endl;
     return 0;
 }

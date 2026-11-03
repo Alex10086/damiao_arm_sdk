@@ -1,15 +1,21 @@
 #include "damiao_arm_sdk/can_transport.hpp"
+#include "damiao_arm_sdk/damiao_usb_transport.hpp"
 #include "damiao_arm_sdk/motor_driver.hpp"
+#include "damiao_arm_sdk/socketcan_bridge.hpp"
 #include "damiao_arm_sdk/types.hpp"
 
 #include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
+#include <pty.h>
 #include <stdexcept>
 #include <thread>
+#include <unistd.h>
+#include <vector>
 
 using namespace damiao;
 
@@ -70,6 +76,22 @@ CanFrame buildMockFeedbackFrame(uint16_t master_id,
     frame.data[6] = t_mos;
     frame.data[7] = t_rotor;
     return frame;
+}
+
+std::vector<uint8_t> buildUsbRxPacket(uint8_t cmd,
+                                      uint32_t can_id,
+                                      uint8_t dlc,
+                                      bool is_ext,
+                                      bool is_rtr,
+                                      const std::array<uint8_t, 8>& data) {
+    std::vector<uint8_t> pkt(16, 0);
+    pkt[0] = 0xAA;
+    pkt[1] = cmd;
+    pkt[2] = (dlc & 0x3F) | (is_ext ? 0x40 : 0x00) | (is_rtr ? 0x80 : 0x00);
+    std::memcpy(&pkt[3], &can_id, 4);
+    std::memcpy(&pkt[7], data.data(), 8);
+    pkt[15] = 0x55;
+    return pkt;
 }
 
 void testProtocolCodec() {
@@ -146,7 +168,6 @@ void testFeedbackParsingAndHighCanId() {
     EXPECT_TRUE(fault_state.error == MotorError::COIL_OVERTEMP, "Fault code COIL_OVERTEMP (0xC)");
     EXPECT_TRUE(fault_state.rx_count == 2, "RX counter incremented");
 
-    // P1 Test: CAN ID > 15 (e.g. can_id = 0x15 = 21, master_id = 0x25), where firmware puts non-matching 4-bit value or truncated ID in byte[0]
     auto transport = std::make_shared<SocketCanTransport>();
     MotorConfig cfg_high = MotorConfig::J4310(0x15, 0x25, ControlMode::MIT);
     MotorDriver driver_high(transport, cfg_high);
@@ -161,7 +182,6 @@ void testP0AndP1Fixes() {
     auto tx_transport = std::make_shared<SocketCanTransport>("vcan0", true);
     auto rx_transport = std::make_shared<SocketCanTransport>("vcan0", true);
 
-    // 1. P0: Control mode mismatch checks
     MotorConfig mit_cfg = MotorConfig::J4310(0x01, 0x11, ControlMode::MIT);
     MotorDriver mit_driver(tx_transport, mit_cfg);
     EXPECT_THROW(mit_driver.setPosVel(1.0f, 1.0f), std::logic_error, "setPosVel throws when configured in MIT mode");
@@ -171,7 +191,6 @@ void testP0AndP1Fixes() {
     MotorDriver pv_driver(tx_transport, pv_cfg);
     EXPECT_THROW(pv_driver.setMIT(0.0f, 0.0f, 1.0f, 0.1f, 0.0f), std::logic_error, "setMIT throws when configured in POS_VEL mode");
 
-    // 2. P0: Special command CAN ID mode compatibility (with and without mode offset)
     EXPECT_TRUE(pv_driver.specialCommandCanId() == 0x102, "Default specialCommandCanId includes mode offset (0x102)");
     pv_driver.enable();
     CanFrame wire_frame;
@@ -184,16 +203,13 @@ void testP0AndP1Fixes() {
     pv_raw_driver.enable();
     EXPECT_TRUE(rx_transport->receive(wire_frame, 50) && wire_frame.can_id == 0x02, "POS_VEL enable uses raw 0x02 when configured");
 
-    // 3. P1: strict_range_check is enabled by default
     EXPECT_TRUE(mit_cfg.strict_range_check == true, "MotorConfig::strict_range_check defaults to true");
     EXPECT_THROW(mit_driver.setMIT(20.0f, 0.0f, 1.0f, 0.1f, 0.0f), std::out_of_range, "Default strict_range_check throws on pos > 12.5");
 
-    // 4. P1: Distinction between ProtocolLimits (mapping span) and CommandLimits (physical travel / multi-turn)
     MotorConfig joint_cfg = MotorConfig::J4310(0x01, 0x11, ControlMode::MIT);
-    joint_cfg.cmd_limits.pos_min = -1.57f; // Physical joint limit [-90 deg, +90 deg]
+    joint_cfg.cmd_limits.pos_min = -1.57f;
     joint_cfg.cmd_limits.pos_max = 1.57f;
     MotorDriver joint_driver(tx_transport, joint_cfg);
-    // 2.0 rad is within ProtocolLimits (12.5 rad) but exceeds physical joint CommandLimits (1.57 rad)
     EXPECT_THROW(joint_driver.setMIT(2.0f, 0.0f, 10.0f, 0.5f, 0.0f), std::out_of_range,
                  "Physical CommandLimits [-1.57, 1.57] enforced even when inside ProtocolLimits [-12.5, 12.5]");
 }
@@ -284,6 +300,109 @@ void testVcan0Communication() {
     EXPECT_TRUE(st.temp_mos == 31 && st.temp_rotor == 33, "vcan0 feedback temperatures match");
 }
 
+void testUsbTransportAndBridgeEdgeCases() {
+    std::cout << "[TEST] USB Transport & Bridge (Malformed Frames / Partial Reads / Disconnect / No Loopback)..." << std::endl;
+
+    int master_fd = -1;
+    int slave_fd = -1;
+    char slave_name[128]{};
+    int rc = ::openpty(&master_fd, &slave_fd, slave_name, nullptr, nullptr);
+    EXPECT_TRUE(rc == 0 && master_fd >= 0 && slave_fd >= 0, "openpty created virtual serial pair");
+    ::close(slave_fd); // DamiaoUsbCanTransport will open slave_name by path
+
+    DamiaoUsbCanTransport usb(slave_name, 921600);
+    EXPECT_TRUE(usb.isOpen(), "DamiaoUsbCanTransport opened pty slave");
+
+    // 1. Test garbage bytes + non-0x11 packet + malformed DLC (>8) + malformed ID (>0x7FF) + valid 0x11 packet
+    std::vector<uint8_t> stream = {0x00, 0xFF, 0xAA, 0x99, 0x12}; // 5 garbage bytes
+    auto ack_pkt = buildUsbRxPacket(0x03, 0x01, 8, false, false, {1, 2, 3, 4, 5, 6, 7, 8}); // non-0x11
+    auto bad_dlc_pkt = buildUsbRxPacket(0x11, 0x11, 15, false, false, {1, 2, 3, 4, 5, 6, 7, 8}); // DLC=15 > 8
+    auto bad_id_pkt = buildUsbRxPacket(0x11, 0x999, 8, false, false, {1, 2, 3, 4, 5, 6, 7, 8}); // std ID 0x999 > 0x7FF
+    auto valid_pkt = buildUsbRxPacket(0x11, 0x11, 8, false, false, {0x11, 0x80, 0x00, 0x80, 0x08, 0x00, 27, 25});
+
+    stream.insert(stream.end(), ack_pkt.begin(), ack_pkt.end());
+    stream.insert(stream.end(), bad_dlc_pkt.begin(), bad_dlc_pkt.end());
+    stream.insert(stream.end(), bad_id_pkt.begin(), bad_id_pkt.end());
+    stream.insert(stream.end(), valid_pkt.begin(), valid_pkt.end());
+
+    // Write stream in two partial chunks to verify stream reassembly
+    ssize_t w1 = ::write(master_fd, stream.data(), 19);
+    EXPECT_TRUE(w1 == 19, "Wrote first partial chunk to pty master");
+    CanFrame rx_frame;
+    EXPECT_TRUE(!usb.receive(rx_frame, 10), "Partial stream does not emit premature frame");
+
+    ssize_t w2 = ::write(master_fd, stream.data() + 19, stream.size() - 19);
+    EXPECT_TRUE(w2 == static_cast<ssize_t>(stream.size() - 19), "Wrote remaining chunk to pty master");
+
+    EXPECT_TRUE(usb.receive(rx_frame, 50), "Recovered valid frame after garbage/ACK/malformed packets");
+    EXPECT_TRUE(rx_frame.can_id == 0x11 && rx_frame.dlc == 8 && rx_frame.data[6] == 27 && rx_frame.data[7] == 25,
+                "Decoded valid frame ID, DLC, and payload match");
+
+    auto st = usb.getStats();
+    EXPECT_TRUE(st.rx_frames == 1, "Stats counted 1 valid frame");
+    EXPECT_TRUE(st.rx_non_data_packets == 1, "Stats counted 1 non-0x11 packet");
+    EXPECT_TRUE(st.rx_malformed_frames == 2, "Stats counted 2 malformed frames (bad DLC and bad ID)");
+    EXPECT_TRUE(st.rx_discarded_bytes >= 5, "Stats counted discarded garbage bytes");
+
+    // 2. Test Bridge forwarding & anti-loopback using pty + vcan0
+    usb.close();
+
+    BridgeConfig bcfg;
+    bcfg.socketcan_if = "vcan0";
+    bcfg.serial_port = slave_name;
+    bcfg.auto_reconnect = false;
+    SocketCanUsbBridge bridge(bcfg);
+    bridge.start();
+    EXPECT_TRUE(bridge.isRunning(), "SocketCanUsbBridge started");
+
+    SocketCanTransport app_can("vcan0", true);
+    // Drain any existing frames
+    CanFrame drain;
+    while (app_can.receive(drain, 5)) {}
+
+    // Inject a frame from USB side -> vcan0, verify app_can receives it, and verify bridge does NOT echo it back to USB!
+    int flags = ::fcntl(master_fd, F_GETFL, 0);
+    ::fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+    uint8_t flush_buf[256];
+    while (::read(master_fd, flush_buf, sizeof(flush_buf)) > 0) {}
+
+    auto usb_in_pkt = buildUsbRxPacket(0x11, 0x11, 8, false, false, {0x01, 0x7F, 0xFF, 0x7F, 0xF7, 0xFF, 26, 24});
+    EXPECT_TRUE(::write(master_fd, usb_in_pkt.data(), usb_in_pkt.size()) == 16, "Injected USB->vcan0 frame");
+
+    CanFrame vcan_rx;
+    EXPECT_TRUE(app_can.receive(vcan_rx, 100), "Application on vcan0 received frame forwarded from USB");
+    EXPECT_TRUE(vcan_rx.can_id == 0x11 && vcan_rx.dlc == 8 && vcan_rx.data[6] == 26, "Forwarded frame content intact");
+
+    // Wait 30ms and verify bridge did NOT loop that frame back to master_fd!
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    ssize_t echo_bytes = ::read(master_fd, flush_buf, sizeof(flush_buf));
+    EXPECT_TRUE(echo_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+                "Zero loopback: USB->vcan0 frame was NOT echoed back to USB");
+
+    // Now send a command from app_can on vcan0 -> Bridge -> USB master_fd
+    CanFrame cmd_frame;
+    cmd_frame.can_id = 0x7FF;
+    cmd_frame.dlc = 8;
+    cmd_frame.data = {0x01, 0x00, 0xCC, 0, 0, 0, 0, 0};
+    app_can.send(cmd_frame);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    uint8_t tx_pkt_buf[64]{};
+    ssize_t tx_bytes = ::read(master_fd, tx_pkt_buf, sizeof(tx_pkt_buf));
+    EXPECT_TRUE(tx_bytes == 30 && tx_pkt_buf[0] == 0x55 && tx_pkt_buf[1] == 0xAA,
+                "vcan0->USB command forwarded as exact 30-byte Damiao USB packet");
+    uint32_t forwarded_id = 0;
+    std::memcpy(&forwarded_id, &tx_pkt_buf[13], 4);
+    EXPECT_TRUE(forwarded_id == 0x7FF && tx_pkt_buf[18] == 8 && tx_pkt_buf[21] == 0x01 && tx_pkt_buf[23] == 0xCC,
+                "vcan0->USB packet CAN ID (0x7FF), DLC (8), and payload [01 00 CC ...] verified");
+
+    // 3. Simulate USB disconnect by closing master_fd and verifying bridge detects it and exits cleanly
+    ::close(master_fd);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_TRUE(!bridge.isRunning(), "Bridge with auto_reconnect=false stopped cleanly on USB disconnect (POLLHUP/EIO)");
+    bridge.stop();
+}
+
 } // namespace
 
 int main() {
@@ -292,6 +411,7 @@ int main() {
     testP0AndP1Fixes();
     testExceptionsAndEdgeCases();
     testVcan0Communication();
+    testUsbTransportAndBridgeEdgeCases();
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "Tests Passed: " << g_passed << " | Failed: " << g_failed << std::endl;

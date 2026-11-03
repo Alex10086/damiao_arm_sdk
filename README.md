@@ -1,63 +1,44 @@
-# Damiao J4310 (24V) Linux SocketCAN C++ SDK (V0.1 - Single Motor)
+# Damiao Arm SDK (OpenArm CAN Submodule + USB-CAN Bridge)
 
-C++17 SDK for Damiao **DM-J4310-2EC (24V)** motors over Linux SocketCAN, designed as the V0.1 single-motor foundation for a 6-axis robotic arm.
+C++17 SDK for **Damiao DM-J4310-2EC (24V)** motors and robotic arms, integrating [`enactic/openarm_can`](https://github.com/enactic/openarm_can) as an unmodified Git submodule (`third_party/openarm_can`) and providing a transparent, low-latency **Linux SocketCAN (`vcan0`) <-> Damiao USB-CAN (`/dev/ttyACM0`) Bridge**.
 
-## Architecture
+## Phase 1 Architecture: Transparent Driver Adaptation
 
 ```
-        Test / Upper Application
-                   │
-                   ▼
-          ┌──────────────────┐
-          │   MotorDriver    │
-          │                  │
-          │  enable()        │
-          │  disable()       │
-          │  setMIT()        │
-          │  setPosVel()     │
-          │  setVelocity()   │
-          │  getState()      │
-          └────────┬─────────┘
-                   │
-                   ▼
-          ┌──────────────────┐
-          │   CAN Transport  │
-          │                  │
-          │  open()          │
-          │  send()          │
-          │  receive()       │
-          │  close()         │
-          └────────┬─────────┘
-                   │
-                   ▼
-            Linux SocketCAN
-                   │
-                   ▼
-           Damiao J4310 Motor
+┌────────────────────────────────────────────────────────┐
+│            Unmodified OpenArm CAN Submodule            │
+│       OpenArm("vcan0", false) -> DM4310 (0x01/0x11)    │
+└───────────────────────────┬────────────────────────────┘
+                            │ Linux SocketCAN (vcan0)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│                  SocketCanUsbBridge                    │
+│  - Loopback=1, RecvOwnMsgs=0 (zero self-echo loopback) │
+│  - Partial write retry, disconnect & auto-reconnect    │
+│  - Strict CAN ID / DLC / error-frame filtering         │
+└───────────────────────────┬────────────────────────────┘
+                            │ Damiao USB-CDC (921600)
+                            ▼
+                 /dev/ttyACM0 -> J4310 Motor
 ```
 
-## V0.1 Modules
-
-| Module | File(s) | Description |
-|---|---|---|
-| `MotorConfig` / `MotorState` | `include/damiao_arm_sdk/types.hpp` | Model limits (`P_MAX=12.5 rad`, `V_MAX=30.0 rad/s`, `T_MAX=10.0 Nm`), CAN IDs, control mode, fault enum (`0x0`–`0xE`), feedback staleness check |
-| `SocketCanTransport` | `include/damiao_arm_sdk/can_transport.hpp`, `src/can_transport.cpp` | Linux `PF_CAN` raw socket `open`/`close`/`send`/`receive` with `poll()` timeout and `CAN_RAW_LOOPBACK` |
-| `MotorDriver` & `protocol` | `include/damiao_arm_sdk/motor_driver.hpp`, `src/motor_driver.cpp` | Damiao MIT / POS_VEL / VEL / Enable / Disable / SaveZero / ClearError encoding & 8-byte feedback decoding |
-| `Tests` | `tests/test_sdk.cpp` | Protocol codec unit tests, feedback parser tests, exception/staleness tests, and `vcan0` loopback integration tests |
-| `Example` | `examples/single_motor_demo.cpp` | Single-motor CLI demo (supports `vcan0` virtual responder or `--real-hw` on `can0`) |
-
-## Build & Run Tests
+## Build & Run
 
 ```bash
-chmod +x scripts/setup_vcan.sh
+# 1. Setup virtual CAN interface vcan0
 ./scripts/setup_vcan.sh vcan0
 
+# 2. Configure & build
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build -j4
 
-# Run unit + vcan0 tests
+# 3. Run unit & bridge edge-case tests (79 checks)
 ctest --test-dir build --output-on-failure
 
-# Run single motor demo on vcan0
-./build/single_motor_demo --interface vcan0 --can-id 0x01 --master-id 0x11
+# 4. Run Phase 1 OpenArm CAN + Real J4310 hardware acceptance test (embedded bridge)
+./build/openarm_single_motor_test --interface vcan0 --serial /dev/ttyACM0 --with-bridge --samples 200 --period-ms 5
+
+# Or run standalone bridge daemon + OpenArm test separately:
+./build/damiao_socketcan_bridge --socketcan vcan0 --serial /dev/ttyACM0 &
+./build/openarm_single_motor_test --interface vcan0 --samples 500 --period-ms 2
 ```
