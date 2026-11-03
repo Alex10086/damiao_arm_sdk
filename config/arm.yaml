@@ -1,0 +1,78 @@
+# Damiao 6-Axis Robotic Arm Configuration
+can_interface: vcan0
+enable_fd: false
+state_timeout_ms: 500
+recv_timeout_us: 1000
+
+joints:
+  - name: joint1
+    motor_type: DM4310
+    send_can_id: 0x01
+    recv_can_id: 0x11
+    control_mode: MIT
+    pos_min: -3.1416
+    pos_max: 3.1416
+    vel_max: 30.0
+    tau_max: 10.0
+    kp_max: 500.0
+    kd_max: 5.0
+
+  - name: joint2
+    motor_type: DM4310
+    send_can_id: 0x02
+    recv_can_id: 0x12
+    control_mode: MIT
+    pos_min: -3.1416
+    pos_max: 3.1416
+    vel_max: 30.0
+    tau_max: 10.0
+    kp_max: 500.0
+    kd_max: 5.0
+
+  - name: joint3
+    motor_type: DM4310
+    send_can_id: 0x03
+    recv_can_id: 0x13
+    control_mode: MIT
+    pos_min: -3.1416
+    pos_max: 3.1416
+    vel_max: 30.0
+    tau_max: 10.0
+    kp_max: 500.0
+    kd_max: 5.0
+
+  - name: joint4
+    motor_type: DM4310
+    send_can_id: 0x04
+    recv_can_id: 0x14
+    control_mode: MIT
+    pos_min: -3.1416
+    pos_max: 3.1416
+    vel_max: 30.0
+    tau_max: 10.0
+    kp_max: 500.0
+    kd_max: 5.0
+
+  - name: joint5
+    motor_type: DM4310
+    send_can_id: 0x05
+    recv_can_id: 0x15
+    control_mode: MIT
+    pos_min: -3.1416
+    pos_max: 3.1416
+    vel_max: 30.0
+    tau_max: 10.0
+    kp_max: 500.0
+    kd_max: 5.0
+
+  - name: joint6
+    motor_type: DM4310
+    send_can_id: 0x06
+    recv_can_id: 0x16
+    control_mode: MIT
+    pos_min: -3.1416
+    pos_max: 3.1416
+    vel_max: 30.0
+    tau_max: 10.0
+    kp_max: 500.0
+    kd_max: 5.0
