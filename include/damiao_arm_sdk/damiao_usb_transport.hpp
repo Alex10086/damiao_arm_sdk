@@ -1,15 +1,28 @@
 #pragma once
 
-#include "damiao_arm_sdk/can_transport.hpp"
-
+#include <array>
 #include <atomic>
 #include <cstdint>
-#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace damiao {
+
+struct CanFrame {
+    uint32_t can_id{0}; // 11-bit standard CAN ID (0x000 ~ 0x7FF) or 29-bit extended
+    uint8_t dlc{8};     // Data length code (0 ~ 8)
+    std::array<uint8_t, 8> data{0, 0, 0, 0, 0, 0, 0, 0};
+    bool is_extended{false};
+    bool is_rtr{false};
+    bool is_error{false};
+};
+
+class CanException : public std::runtime_error {
+public:
+    explicit CanException(const std::string& msg) : std::runtime_error(msg) {}
+};
 
 struct UsbTransportStats {
     uint64_t tx_packets{0};
@@ -22,23 +35,23 @@ struct UsbTransportStats {
 
 // Direct USB-CAN Transport for Damiao official USB-to-CAN adapter (/dev/ttyACM*)
 // Default baud rate for Damiao CDC virtual serial port is 921600.
-class DamiaoUsbCanTransport : public ICanTransport {
+class DamiaoUsbCanTransport {
 public:
     DamiaoUsbCanTransport() = default;
     explicit DamiaoUsbCanTransport(const std::string& port_path, int baudrate = 921600);
-    ~DamiaoUsbCanTransport() override;
+    ~DamiaoUsbCanTransport();
 
     DamiaoUsbCanTransport(const DamiaoUsbCanTransport&) = delete;
     DamiaoUsbCanTransport& operator=(const DamiaoUsbCanTransport&) = delete;
 
-    void open(const std::string& port_path) override;
-    void close() noexcept override;
-    bool isOpen() const noexcept override;
+    void open(const std::string& port_path);
+    void close() noexcept;
+    bool isOpen() const noexcept;
 
-    void send(const CanFrame& frame) override;
-    bool receive(CanFrame& frame, int timeout_ms = 10) override;
+    void send(const CanFrame& frame);
+    bool receive(CanFrame& frame, int timeout_ms = 10);
 
-    std::string interfaceName() const override;
+    std::string interfaceName() const;
     int baudrate() const noexcept { return baudrate_; }
     void setBaudrate(int baudrate) noexcept { baudrate_ = baudrate; }
 

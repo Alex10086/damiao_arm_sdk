@@ -32,6 +32,8 @@ int main(int argc, char** argv) {
             cfg.baudrate = std::stoi(argv[++i]);
         } else if (arg == "--no-reconnect") {
             cfg.auto_reconnect = false;
+        } else if (arg == "--read-only" || arg == "--readonly") {
+            cfg.read_only = true;
         } else if (arg == "--verbose" || arg == "-v") {
             cfg.verbose = true;
         }
@@ -40,6 +42,7 @@ int main(int argc, char** argv) {
     std::cout << "=== Damiao USB-CAN <-> Linux SocketCAN Bridge ===" << std::endl;
     std::cout << "SocketCAN Interface: " << cfg.socketcan_if << std::endl;
     std::cout << "USB-CAN Serial Port: " << cfg.serial_port << " @" << cfg.baudrate << std::endl;
+    std::cout << "Read-Only Filter   : " << (cfg.read_only ? "ENABLED (blocks motion/enable/write_param)" : "disabled") << std::endl;
     std::cout << "Auto Reconnect     : " << (cfg.auto_reconnect ? "enabled" : "disabled") << std::endl;
 
     try {
@@ -55,6 +58,7 @@ int main(int argc, char** argv) {
         auto st = bridge.getStats();
         std::cout << "Bridge stopped. Forwarded SocketCAN->USB: " << st.sock_to_usb_forwarded
                   << ", USB->SocketCAN: " << st.usb_to_sock_forwarded
+                  << " | ReadOnly Blocked: " << st.sock_readonly_blocked
                   << " | Dropped(sock/usb): " << st.sock_rx_dropped << "/" << st.usb_rx_dropped
                   << " | Errors(sock/usb): " << st.sock_errors << "/" << st.usb_errors
                   << " | Reconnects: " << st.usb_reconnects << std::endl;

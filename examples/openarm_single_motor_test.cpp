@@ -19,7 +19,6 @@
 
 using openarm::can::socket::OpenArm;
 using openarm::damiao_motor::CallbackMode;
-using openarm::damiao_motor::ControlMode;
 using openarm::damiao_motor::MotorType;
 using openarm::damiao_motor::RID;
 
@@ -87,7 +86,7 @@ int main(int argc, char** argv) {
     std::cout << "  OpenArm Interface : " << can_if << " (CAN 2.0, enable_fd = false)\n";
     std::cout << "  Target Motor      : J4310 (MotorType::DM4310)\n";
     std::cout << "  Send / Recv ID    : 0x" << std::hex << send_id << " / 0x" << recv_id << std::dec << "\n";
-    std::cout << "  Embedded Bridge   : " << (embed_bridge ? ("YES (" + serial_port + ")") : "NO (external bridge daemon)") << "\n";
+    std::cout << "  Embedded Bridge   : " << (embed_bridge ? ("YES (" + serial_port + ", read_only=true)") : "NO (external bridge daemon)") << "\n";
     std::cout << "--------------------------------------------------------------------\n";
 
     std::unique_ptr<damiao::SocketCanUsbBridge> bridge;
@@ -97,15 +96,17 @@ int main(int argc, char** argv) {
         bcfg.serial_port = serial_port;
         bcfg.baudrate = 921600;
         bcfg.auto_reconnect = true;
+        bcfg.read_only = true; // P0 Safety: enforce read-only command filter in read-only acceptance test
         bridge = std::make_unique<damiao::SocketCanUsbBridge>(bcfg);
         bridge->start();
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 
     // 1. Initialize OpenArm("vcan0", false) with single J4310 motor
-    std::cout << "\n[Step 1] Initializing OpenArm(\"" << can_if << "\", false) with single J4310 motor...\n";
+    // P0 Fix: Do NOT pass control_modes here so OpenArm does NOT write RID::CTRL_MODE (0x55) to the motor during read-only init!
+    std::cout << "\n[Step 1] Initializing OpenArm(\"" << can_if << "\", false) with single J4310 motor (purely passive, no register writes)...\n";
     OpenArm openarm(can_if, false);
-    openarm.init_arm_motors({MotorType::DM4310}, {send_id}, {recv_id}, {ControlMode::MIT});
+    openarm.init_arm_motors({MotorType::DM4310}, {send_id}, {recv_id});
     openarm.set_callback_mode_all(CallbackMode::STATE);
 
     // Drain any residual frames
@@ -287,6 +288,7 @@ int main(int argc, char** argv) {
         std::printf("\n  --- Bridge Forwarding Diagnostics ---\n");
         std::printf("  vcan0 -> USB forwarded : %lu\n", bst.sock_to_usb_forwarded);
         std::printf("  USB -> vcan0 forwarded : %lu\n", bst.usb_to_sock_forwarded);
+        std::printf("  Read-Only Blocked      : %lu\n", bst.sock_readonly_blocked);
         std::printf("  Dropped (vcan0 / USB)  : %lu / %lu\n", bst.sock_rx_dropped, bst.usb_rx_dropped);
         std::printf("  Errors  (vcan0 / USB)  : %lu / %lu\n", bst.sock_errors, bst.usb_errors);
         bridge->stop();

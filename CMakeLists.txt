@@ -13,9 +13,7 @@ set(BUILD_TESTING OFF CACHE BOOL "Skip openarm_can internal tests" FORCE)
 add_subdirectory(third_party/openarm_can EXCLUDE_FROM_ALL)
 
 add_library(damiao_arm_sdk STATIC
-    src/can_transport.cpp
     src/damiao_usb_transport.cpp
-    src/motor_driver.cpp
     src/socketcan_bridge.cpp
 )
 
@@ -28,10 +26,6 @@ target_include_directories(damiao_arm_sdk
 find_package(Threads REQUIRED)
 target_link_libraries(damiao_arm_sdk PUBLIC Threads::Threads)
 
-# Single-motor demo executable
-add_executable(single_motor_demo examples/single_motor_demo.cpp)
-target_link_libraries(single_motor_demo PRIVATE damiao_arm_sdk)
-
 # SocketCAN <-> Damiao USB-CAN bridge daemon
 add_executable(damiao_socketcan_bridge examples/damiao_socketcan_bridge.cpp)
 target_link_libraries(damiao_socketcan_bridge PRIVATE damiao_arm_sdk)
@@ -40,8 +34,8 @@ target_link_libraries(damiao_socketcan_bridge PRIVATE damiao_arm_sdk)
 add_executable(openarm_single_motor_test examples/openarm_single_motor_test.cpp)
 target_link_libraries(openarm_single_motor_test PRIVATE damiao_arm_sdk openarm_can)
 
-# Unit & vcan0 integration tests
+# Unit & vcan0/pty integration tests
 enable_testing()
 add_executable(test_sdk tests/test_sdk.cpp)
-target_link_libraries(test_sdk PRIVATE damiao_arm_sdk util)
+target_link_libraries(test_sdk PRIVATE damiao_arm_sdk openarm_can util)
 add_test(NAME DamiaoSdkTests COMMAND test_sdk)
