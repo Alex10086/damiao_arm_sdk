@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, sigHandler);
     std::signal(SIGTERM, sigHandler);
 
-    BridgeConfig cfg;
+    BridgeConfig cfg; // cfg.read_only defaults to true
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--socketcan" && i + 1 < argc) {
@@ -34,6 +34,8 @@ int main(int argc, char** argv) {
             cfg.auto_reconnect = false;
         } else if (arg == "--read-only" || arg == "--readonly") {
             cfg.read_only = true;
+        } else if (arg == "--allow-motion" || arg == "--writable") {
+            cfg.read_only = false;
         } else if (arg == "--verbose" || arg == "-v") {
             cfg.verbose = true;
         }
@@ -42,7 +44,10 @@ int main(int argc, char** argv) {
     std::cout << "=== Damiao USB-CAN <-> Linux SocketCAN Bridge ===" << std::endl;
     std::cout << "SocketCAN Interface: " << cfg.socketcan_if << std::endl;
     std::cout << "USB-CAN Serial Port: " << cfg.serial_port << " @" << cfg.baudrate << std::endl;
-    std::cout << "Read-Only Filter   : " << (cfg.read_only ? "ENABLED (blocks motion/enable/write_param)" : "disabled") << std::endl;
+    std::cout << "Safety Mode        : "
+              << (cfg.read_only ? "READ-ONLY (default, blocks motion/enable/write_param)"
+                                : "WRITABLE (--allow-motion authorized)")
+              << std::endl;
     std::cout << "Auto Reconnect     : " << (cfg.auto_reconnect ? "enabled" : "disabled") << std::endl;
 
     try {

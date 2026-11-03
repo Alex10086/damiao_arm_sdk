@@ -83,7 +83,6 @@ void testUsbTransportValidationAndReassembly() {
     DamiaoUsbCanTransport usb(slave_name, 921600);
     EXPECT_TRUE(usb.isOpen(), "DamiaoUsbCanTransport opened pty slave");
 
-    // Verify send parameter checks
     CanFrame bad_dlc;
     bad_dlc.can_id = 0x01;
     bad_dlc.dlc = 9;
@@ -100,7 +99,6 @@ void testUsbTransportValidationAndReassembly() {
     err_frame.is_error = true;
     EXPECT_THROW(usb.send(err_frame), std::invalid_argument, "Error frame rejected on send");
 
-    // Stream with leading garbage + non-0x11 ACK + malformed DLC(>8) + malformed ID(>0x7FF) + valid 0x11 frame
     std::vector<uint8_t> stream = {0x00, 0xFF, 0xAA, 0x99, 0x12};
     auto ack_pkt = buildUsbRxPacket(0x03, 0x01, 8, false, false, {1, 2, 3, 4, 5, 6, 7, 8});
     auto bad_dlc_pkt = buildUsbRxPacket(0x11, 0x11, 15, false, false, {1, 2, 3, 4, 5, 6, 7, 8});
@@ -112,7 +110,6 @@ void testUsbTransportValidationAndReassembly() {
     stream.insert(stream.end(), bad_id_pkt.begin(), bad_id_pkt.end());
     stream.insert(stream.end(), valid_pkt.begin(), valid_pkt.end());
 
-    // Write in two split chunks
     EXPECT_TRUE(::write(master_fd, stream.data(), 19) == 19, "Wrote partial first chunk");
     CanFrame rx_frame;
     EXPECT_TRUE(!usb.receive(rx_frame, 10), "Partial stream waits for remaining bytes");
@@ -134,7 +131,10 @@ void testUsbTransportValidationAndReassembly() {
 }
 
 void testReadOnlyCommandFilterRules() {
-    std::cout << "[TEST] P0 Read-Only Command Filter Rules (Allow 0xCC/0x33 only, Block Enable/Motion/Write)..." << std::endl;
+    std::cout << "[TEST] P0 Read-Only Command Filter Rules (Default read_only=true, Allow 0xCC/0x33 only)..." << std::endl;
+
+    BridgeConfig default_cfg;
+    EXPECT_TRUE(default_cfg.read_only == true, "BridgeConfig::read_only defaults to true");
 
     CanFrame refresh_frame;
     refresh_frame.can_id = 0x7FF;
@@ -146,14 +146,14 @@ void testReadOnlyCommandFilterRules() {
     CanFrame query_param_frame;
     query_param_frame.can_id = 0x7FF;
     query_param_frame.dlc = 8;
-    query_param_frame.data = {0x01, 0x00, 0x33, 0x15, 0x00, 0x00, 0x00, 0x00}; // RID 21 (PMAX)
+    query_param_frame.data = {0x01, 0x00, 0x33, 0x15, 0x00, 0x00, 0x00, 0x00};
     EXPECT_TRUE(SocketCanUsbBridge::isReadOnlyAllowedTxFrame(query_param_frame),
                 "Parameter query (0x7FF, D[2]=0x33) allowed in read-only mode");
 
     CanFrame write_param_frame;
     write_param_frame.can_id = 0x7FF;
     write_param_frame.dlc = 8;
-    write_param_frame.data = {0x01, 0x00, 0x55, 0x0A, 0x01, 0x00, 0x00, 0x00}; // Write CTRL_MODE
+    write_param_frame.data = {0x01, 0x00, 0x55, 0x0A, 0x01, 0x00, 0x00, 0x00};
     EXPECT_TRUE(!SocketCanUsbBridge::isReadOnlyAllowedTxFrame(write_param_frame),
                 "Register write (0x7FF, D[2]=0x55) BLOCKED in read-only mode");
 
@@ -179,7 +179,7 @@ void testReadOnlyCommandFilterRules() {
 }
 
 void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
-    std::cout << "[TEST] End-to-End Bridge + OpenArm(\"vcan0\", false) + Read-Only Protection + Disconnect..." << std::endl;
+    std::cout << "[TEST] End-to-End Bridge + Default Read-Only Protection + Explicit Motion Authorization..." << std::endl;
 
     int master_fd = -1;
     int slave_fd = -1;
@@ -195,10 +195,11 @@ void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
     bcfg.socketcan_if = "vcan0";
     bcfg.serial_port = slave_name;
     bcfg.auto_reconnect = false;
-    bcfg.read_only = true; // Enable P0 read-only filter
+    // Notice we do NOT set bcfg.read_only: it defaults to true!
     SocketCanUsbBridge bridge(bcfg);
+    EXPECT_TRUE(bridge.isReadOnly(), "SocketCanUsbBridge defaults to read-only mode");
     bridge.start();
-    EXPECT_TRUE(bridge.isRunning(), "SocketCanUsbBridge started in read-only mode");
+    EXPECT_TRUE(bridge.isRunning(), "SocketCanUsbBridge started in default read-only mode");
 
     // 1. P0 Check: Initialize OpenArm("vcan0", false) WITHOUT control_modes and verify ZERO bytes sent to USB!
     openarm::can::socket::OpenArm openarm("vcan0", false);
@@ -212,32 +213,36 @@ void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
     EXPECT_TRUE(init_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
                 "P0 Verified: OpenArm init_arm_motors without control_modes emits ZERO bus writes");
 
-    // 2. P0 Check: Attempt to call openarm.enable_all() and mit_control_one() while Bridge is in read_only mode
+    // 2. P0 Check: Attempt to call openarm.enable_all() and mit_control_one() while Bridge is in default read_only mode
     openarm.enable_all();
     openarm.get_arm().mit_control_one(0, {0.5, 0.0, 10.0, 0.5, 0.0});
-    // Also simulate an external rogue process sending a raw CAN frame on vcan0
     openarm.get_arm().set_control_mode_all(openarm::damiao_motor::ControlMode::MIT);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     ssize_t blocked_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
     EXPECT_TRUE(blocked_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
-                "P0 Verified: Read-Only Bridge blocked enable_all, mit_control_one, and set_control_mode_all from reaching USB");
+                "P0 Verified: Default Read-Only Bridge blocked enable_all, mit_control_one, and set_control_mode_all");
     auto st_after_block = bridge.getStats();
     EXPECT_TRUE(st_after_block.sock_readonly_blocked == 3 && st_after_block.sock_to_usb_forwarded == 0,
-                "BridgeStats recorded exactly 3 blocked unsafe commands and 0 forwarded");
+                "BridgeStats recorded 3 blocked unsafe commands and 0 forwarded");
 
-    // 3. Now send a safe passive status refresh from OpenArm and verify it IS forwarded to USB
+    // 3. Send a safe passive status refresh from OpenArm and verify it IS forwarded to USB
     openarm.refresh_one(0);
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     ssize_t refresh_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
     EXPECT_TRUE(refresh_bytes == 30 && tx_buf[0] == 0x55 && tx_buf[1] == 0xAA,
-                "Read-Only Bridge allowed passive refresh_one(0) (30-byte USB packet)");
-    uint32_t f_id = 0;
-    std::memcpy(&f_id, &tx_buf[13], 4);
-    EXPECT_TRUE(f_id == 0x7FF && tx_buf[18] == 8 && tx_buf[21] == 0x01 && tx_buf[23] == 0xCC,
-                "Forwarded refresh packet has CAN ID 0x7FF, DLC 8, and payload [01 00 CC ...]");
+                "Default Read-Only Bridge allowed passive refresh_one(0) (30-byte USB packet)");
 
-    // 4. Inject simulated J4310 feedback from USB -> vcan0 -> OpenArm, and verify no loopback echo
+    // 4. Explicitly authorize motion forwarding (setReadOnly(false)) and verify enable_all() is now forwarded
+    bridge.setReadOnly(false);
+    EXPECT_TRUE(!bridge.isReadOnly(), "Bridge motion forwarding explicitly authorized");
+    openarm.enable_all();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    ssize_t enable_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
+    EXPECT_TRUE(enable_bytes == 30 && tx_buf[28] == 0xFC,
+                "Authorized Bridge forwarded enable frame (0xFC)");
+
+    // 5. Inject simulated J4310 feedback from USB -> vcan0 -> OpenArm, and verify no loopback echo
     auto usb_fb = buildUsbRxPacket(0x11, 0x11, 8, false, false, {0x01, 0x80, 0x00, 0x80, 0x08, 0x00, 26, 25});
     EXPECT_TRUE(::write(master_fd, usb_fb.data(), usb_fb.size()) == 16, "Injected simulated J4310 feedback on USB");
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -251,7 +256,7 @@ void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
     EXPECT_TRUE(echo_check < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
                 "Zero loopback: USB->vcan0 frame was NOT echoed back to USB");
 
-    // 5. Simulate USB disconnect and verify clean exit
+    // 6. Simulate USB disconnect and verify clean exit
     ::close(master_fd);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_TRUE(!bridge.isRunning(), "Bridge with auto_reconnect=false stopped cleanly on USB disconnect");

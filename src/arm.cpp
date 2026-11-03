@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -192,6 +193,13 @@ Arm::Arm(const ArmConfig& config) : config_(config) {
 }
 
 void Arm::init() {
+    // 3. 禁止危险重初始化：ARMED 和 FAULT 状态不能直接重新 init()
+    if (status_ == ArmStatus::ARMED || status_ == ArmStatus::FAULT) {
+        throw std::logic_error("Arm::init: forbidden while arm status is " +
+                               std::string(toString(status_)) +
+                               " (must be DISCONNECTED or DISARMED)");
+    }
+
     config_.validate();
 
     std::vector<MotorType> types(NUM_JOINTS);
@@ -322,10 +330,16 @@ bool Arm::checkHealth() {
                        " (code=" + std::to_string(js.error_code) + ")");
             return false;
         }
-        // 在已使能 (ARMED) 状态下，如果任一已响应过的电机通信超时，则触发 FAULT
-        if (status_ == ArmStatus::ARMED && js.online && js.stale) {
-            enterFault("Communication timeout on " + config_.joints[i].name);
-            return false;
+        // 在已使能 (ARMED) 状态下，所有电机必须保持在线、有新鲜反馈且处于 enabled 状态
+        if (status_ == ArmStatus::ARMED) {
+            if (!js.online || js.stale) {
+                enterFault("Communication timeout on " + config_.joints[i].name);
+                return false;
+            }
+            if (!js.enabled) {
+                enterFault("Motor unexpectedly disabled on " + config_.joints[i].name);
+                return false;
+            }
         }
     }
 
@@ -340,18 +354,68 @@ void Arm::enable() {
         throw std::logic_error("Arm::enable: arm is in FAULT (" + state_.fault_reason + "), call clearFault() first");
     }
 
-    // 若配置了非 MIT 模式，在使能前同步对应关节的控制模式
+    // 1. 严格使能前检查：六台电机必须全部在线、有新鲜反馈且无故障
+    syncStateFromOpenArm();
+    if (!state_.bus_healthy) {
+        enterFault("Arm::enable: CAN bus unhealthy before enable");
+        throw std::runtime_error(state_.fault_reason);
+    }
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        if (config_.joints[i].control_mode != ControlMode::MIT) {
-            openarm_->get_arm().set_control_mode_one(resolveDeviceIndex(i), config_.joints[i].control_mode);
+        const auto& js = state_.joints[i];
+        if (js.has_fault) {
+            enterFault("Arm::enable: motor fault on " + config_.joints[i].name +
+                       " (code=" + std::to_string(js.error_code) + ")");
+            throw std::runtime_error(state_.fault_reason);
+        }
+        if (!js.online || js.stale) {
+            throw std::runtime_error("Arm::enable: joint " + config_.joints[i].name +
+                                     " is offline or feedback is stale (refresh state before enable)");
         }
     }
 
+    // 若配置了非 MIT 模式，在使能前同步对应关节的控制模式并检查写入成功
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        if (config_.joints[i].control_mode != ControlMode::MIT) {
+            uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+            openarm_->get_arm().set_control_mode_one(resolveDeviceIndex(i), config_.joints[i].control_mode);
+            if (openarm_->get_bus_status().writes_ok != prev_writes + 1) {
+                enterFault("Arm::enable: failed to write control mode on " + config_.joints[i].name);
+                throw std::runtime_error(state_.fault_reason);
+            }
+        }
+    }
+
+    // 发送使能指令并检查 6 帧全部成功写入 SocketCAN
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+    std::array<uint64_t, NUM_JOINTS> prev_responses{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        prev_responses[i] = state_.joints[i].responses;
+    }
+
     openarm_->enable_all();
+    if (openarm_->get_bus_status().writes_ok != prev_writes + NUM_JOINTS) {
+        enterFault("Arm::enable: CAN write failed during enable_all");
+        throw std::runtime_error(state_.fault_reason);
+    }
+
     openarm_->recv_all(config_.recv_timeout_us);
+    syncStateFromOpenArm();
+
+    // 确认六台电机全部返回了使能后的新反馈、无故障且均已进入 enabled (0x1) 状态
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        const auto& js = state_.joints[i];
+        if (js.has_fault) {
+            enterFault("Arm::enable: motor fault reported during enable on " + config_.joints[i].name);
+            throw std::runtime_error(state_.fault_reason);
+        }
+        if (js.responses <= prev_responses[i] || js.stale || !js.enabled) {
+            enterFault("Arm::enable: joint " + config_.joints[i].name + " did not confirm enabled state");
+            throw std::runtime_error(state_.fault_reason);
+        }
+    }
 
     status_ = ArmStatus::ARMED;
-    checkHealth();
+    state_.status = ArmStatus::ARMED;
 }
 
 void Arm::disable() {
@@ -371,20 +435,59 @@ void Arm::clearFault() {
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         throw std::logic_error("Arm::clearFault: arm is DISCONNECTED");
     }
+
+    // 2. 严格故障恢复：先清除总线错误计数并发送失能指令刷新全部电机状态，
+    // 若故障条件（总线异常、电机离线/反馈过期、电机硬件故障或仍处于使能）未消除，禁止退出 FAULT！
     openarm_->clear_bus_status();
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     openarm_->disable_all();
+    if (openarm_->get_bus_status().writes_ok != prev_writes + NUM_JOINTS) {
+        enterFault("Arm::clearFault: CAN write failed while disabling motors");
+        throw std::runtime_error(state_.fault_reason);
+    }
+
     openarm_->recv_all(config_.recv_timeout_us);
+    syncStateFromOpenArm();
+
+    if (!state_.bus_healthy) {
+        enterFault("Arm::clearFault: CAN bus remains unhealthy");
+        throw std::runtime_error(state_.fault_reason);
+    }
+
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        const auto& js = state_.joints[i];
+        if (js.has_fault) {
+            enterFault("Arm::clearFault: fault still active on " + config_.joints[i].name +
+                       " (code=" + std::to_string(js.error_code) + ")");
+            throw std::runtime_error(state_.fault_reason);
+        }
+        if (!js.online || js.stale) {
+            enterFault("Arm::clearFault: joint " + config_.joints[i].name +
+                       " is offline or feedback is stale");
+            throw std::runtime_error(state_.fault_reason);
+        }
+        if (js.enabled) {
+            enterFault("Arm::clearFault: joint " + config_.joints[i].name +
+                       " failed to confirm disabled state");
+            throw std::runtime_error(state_.fault_reason);
+        }
+    }
 
     status_ = ArmStatus::DISARMED;
+    state_.status = ArmStatus::DISARMED;
     state_.fault_reason.clear();
-    syncStateFromOpenArm();
 }
 
 ArmState Arm::refresh(int timeout_us) {
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         throw std::logic_error("Arm::refresh: arm is DISCONNECTED");
     }
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     openarm_->refresh_all();
+    if (openarm_->get_bus_status().writes_ok != prev_writes + NUM_JOINTS) {
+        enterFault("Arm::refresh: CAN write failed during refresh_all");
+        throw std::runtime_error(state_.fault_reason);
+    }
     recv(timeout_us);
     return state_;
 }
@@ -462,8 +565,37 @@ bool Arm::validateCommand(const std::array<VelParam, NUM_JOINTS>& cmds) const {
 }
 
 // ============================================================================
-// 控制指令发送（要求 ARMED + checkHealth + validateCommand）
+// 控制指令发送与底层写入异常检查
 // ============================================================================
+
+void Arm::verifySendSucceeded(const char* api_name,
+                              uint64_t prev_writes_ok,
+                              std::size_t expected_writes,
+                              const std::array<uint32_t, NUM_JOINTS>& prev_rejected) {
+    // 检查是否有指令被 OpenArm 内部因模式不匹配而拒绝
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        uint32_t cur_rej = openarm_->get_arm().get_link_stats(resolveDeviceIndex(i)).rejected_commands;
+        if (cur_rej > prev_rejected[i]) {
+            enterFault(std::string(api_name) + ": command rejected by device on " + config_.joints[i].name);
+            syncStateFromOpenArm();
+            throw std::runtime_error(state_.fault_reason);
+        }
+    }
+
+    // 检查底层 SocketCAN 是否全部写入成功（如部分写入失败、ENOBUFS、ENETDOWN）
+    uint64_t actual_writes = openarm_->get_bus_status().writes_ok - prev_writes_ok;
+    if (actual_writes != expected_writes || !openarm_->is_bus_healthy()) {
+        int err = openarm_->get_bus_status().last_write_errno;
+        std::string err_str = err ? std::string(std::strerror(err)) : "bus write error";
+        enterFault(std::string(api_name) + ": CAN send failed (" +
+                   std::to_string(actual_writes) + "/" + std::to_string(expected_writes) +
+                   " frames written, " + err_str + ")");
+        syncStateFromOpenArm();
+        throw std::runtime_error(state_.fault_reason);
+    }
+
+    syncStateFromOpenArm();
+}
 
 void Arm::sendMIT(std::size_t joint_idx, const MITParam& cmd) {
     if (status_ != ArmStatus::ARMED) {
@@ -475,7 +607,13 @@ void Arm::sendMIT(std::size_t joint_idx, const MITParam& cmd) {
     if (!validateCommand(joint_idx, cmd)) {
         throw std::invalid_argument("Arm::sendMIT: invalid MIT command on joint " + std::to_string(joint_idx));
     }
+
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+    std::array<uint32_t, NUM_JOINTS> prev_rej{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+
     openarm_->get_arm().mit_control_one(resolveDeviceIndex(joint_idx), cmd);
+    verifySendSucceeded("Arm::sendMIT", prev_writes, 1, prev_rej);
 }
 
 void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds) {
@@ -488,9 +626,15 @@ void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds) {
     if (!validateCommand(cmds)) {
         throw std::invalid_argument("Arm::sendMITAll: invalid MIT commands");
     }
+
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+    std::array<uint32_t, NUM_JOINTS> prev_rej{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         openarm_->get_arm().mit_control_one(resolveDeviceIndex(i), cmds[i]);
     }
+    verifySendSucceeded("Arm::sendMITAll", prev_writes, NUM_JOINTS, prev_rej);
 }
 
 void Arm::sendPosVel(std::size_t joint_idx, const PosVelParam& cmd) {
@@ -503,7 +647,13 @@ void Arm::sendPosVel(std::size_t joint_idx, const PosVelParam& cmd) {
     if (!validateCommand(joint_idx, cmd)) {
         throw std::invalid_argument("Arm::sendPosVel: invalid PosVel command on joint " + std::to_string(joint_idx));
     }
+
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+    std::array<uint32_t, NUM_JOINTS> prev_rej{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+
     openarm_->get_arm().posvel_control_one(resolveDeviceIndex(joint_idx), cmd);
+    verifySendSucceeded("Arm::sendPosVel", prev_writes, 1, prev_rej);
 }
 
 void Arm::sendPosVelAll(const std::array<PosVelParam, NUM_JOINTS>& cmds) {
@@ -516,9 +666,15 @@ void Arm::sendPosVelAll(const std::array<PosVelParam, NUM_JOINTS>& cmds) {
     if (!validateCommand(cmds)) {
         throw std::invalid_argument("Arm::sendPosVelAll: invalid PosVel commands");
     }
+
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+    std::array<uint32_t, NUM_JOINTS> prev_rej{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         openarm_->get_arm().posvel_control_one(resolveDeviceIndex(i), cmds[i]);
     }
+    verifySendSucceeded("Arm::sendPosVelAll", prev_writes, NUM_JOINTS, prev_rej);
 }
 
 void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
@@ -531,7 +687,13 @@ void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
     if (!validateCommand(joint_idx, cmd)) {
         throw std::invalid_argument("Arm::sendVel: invalid Vel command on joint " + std::to_string(joint_idx));
     }
+
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+    std::array<uint32_t, NUM_JOINTS> prev_rej{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+
     openarm_->get_arm().vel_control_one(resolveDeviceIndex(joint_idx), cmd);
+    verifySendSucceeded("Arm::sendVel", prev_writes, 1, prev_rej);
 }
 
 void Arm::sendVelAll(const std::array<VelParam, NUM_JOINTS>& cmds) {
@@ -544,9 +706,15 @@ void Arm::sendVelAll(const std::array<VelParam, NUM_JOINTS>& cmds) {
     if (!validateCommand(cmds)) {
         throw std::invalid_argument("Arm::sendVelAll: invalid Vel commands");
     }
+
+    uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+    std::array<uint32_t, NUM_JOINTS> prev_rej{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         openarm_->get_arm().vel_control_one(resolveDeviceIndex(i), cmds[i]);
     }
+    verifySendSucceeded("Arm::sendVelAll", prev_writes, NUM_JOINTS, prev_rej);
 }
 
 openarm::can::socket::OpenArm& Arm::rawOpenArm() {

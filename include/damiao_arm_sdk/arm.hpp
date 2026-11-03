@@ -20,14 +20,14 @@ public:
     Arm(const Arm&) = delete;
     Arm& operator=(const Arm&) = delete;
 
-    // 1. 初始化与连接（只读安全连接，不向电机写寄存器或使能）
+    // 1. 初始化与连接（只读安全连接，禁止在 ARMED 或 FAULT 状态直接重初始化）
     void init();
     bool isConnected() const noexcept { return status_ != ArmStatus::DISCONNECTED; }
 
     // 2. 安全状态转换：DISARMED <-> ARMED / FAULT
-    void enable();     // 使能六台电机，进入 ARMED 状态（若在需要时同步控制模式）
+    void enable();     // 严格检查六电机在线、新鲜、无故障并确认全部使能成功后进入 ARMED
     void disable();    // 失能六台电机，回到 DISARMED 状态
-    void clearFault(); // 尝试清除故障并回到 DISARMED 状态
+    void clearFault(); // 严格恢复：仅在总线健康且无电机故障/超时时退出 FAULT 回到 DISARMED
 
     // 3. 状态刷新与读取（只读安全）
     ArmState refresh(int timeout_us = -1);  // 发送 0xCC 刷新并接收更新所有关节状态
@@ -46,7 +46,7 @@ public:
     bool validateCommand(const std::array<VelParam, NUM_JOINTS>& cmds) const;
     void enterFault(const std::string& reason);
 
-    // 5. 控制指令接口（要求处于 ARMED 状态且通过 checkHealth + validateCommand）
+    // 5. 控制指令接口（要求处于 ARMED 状态且通过 checkHealth + validateCommand + 发送结果校验）
     void sendMIT(std::size_t joint_idx, const MITParam& cmd);
     void sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds);
 
@@ -62,6 +62,10 @@ public:
 private:
     void syncStateFromOpenArm();
     int resolveDeviceIndex(std::size_t joint_idx) const;
+    void verifySendSucceeded(const char* api_name,
+                             uint64_t prev_writes_ok,
+                             std::size_t expected_writes,
+                             const std::array<uint32_t, NUM_JOINTS>& prev_rejected);
 
     ArmConfig config_;
     ArmStatus status_{ArmStatus::DISCONNECTED};

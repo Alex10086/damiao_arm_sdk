@@ -19,10 +19,10 @@ struct BridgeConfig {
     int reconnect_interval_ms{200};
     bool allow_extended_frames{false};
     bool allow_rtr_frames{false};
-    // P0 Safety: When read_only is true, SocketCAN -> USB-CAN only allows
+    // P0 Safety: Default read_only is true! SocketCAN -> USB-CAN only allows
     // passive Damiao status refresh (0x7FF, D[2]=0xCC) and parameter query (0x7FF, D[2]=0x33).
-    // All enable (0xFC), motion (MIT/POS_VEL/VEL/POS_FORCE), and register write (0x55/0xAA) frames are blocked.
-    bool read_only{false};
+    // Explicit authorization (read_only = false / --allow-motion) is required to forward motion/enable frames.
+    bool read_only{true};
     bool verbose{false};
 };
 
@@ -79,7 +79,7 @@ private:
     bool tryReconnectUsb();
 
     BridgeConfig config_;
-    std::atomic<bool> read_only_{false};
+    std::atomic<bool> read_only_{true};
 
     int sock_fd_{-1};
     mutable std::mutex sock_mutex_;

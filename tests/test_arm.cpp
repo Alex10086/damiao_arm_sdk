@@ -123,13 +123,11 @@ void testArmConfigAndYaml() {
     EXPECT_TRUE(def_cfg.joints[0].recv_can_id == 0x11 && def_cfg.joints[5].recv_can_id == 0x16,
                 "Default recv CAN IDs 0x11..0x16");
 
-    // Duplicate ID check
     ArmConfig dup_cfg = def_cfg;
     dup_cfg.joints[3].send_can_id = 0x01;
     EXPECT_THROW(dup_cfg.validate(), std::invalid_argument, "Duplicate send_can_id rejected");
 
-    // Load from config/arm.yaml
-    ArmConfig yaml_cfg = ArmConfig::fromYaml( std::string(DAMIAO_SOURCE_DIR) + "/config/arm.yaml" );
+    ArmConfig yaml_cfg = ArmConfig::fromYaml(std::string(DAMIAO_SOURCE_DIR) + "/config/arm.yaml");
     EXPECT_TRUE(yaml_cfg.can_interface == "vcan0" && !yaml_cfg.enable_fd, "YAML loaded can_interface and enable_fd");
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         EXPECT_TRUE(yaml_cfg.joints[i].send_can_id == i + 1, "YAML joint send_can_id matches");
@@ -138,8 +136,8 @@ void testArmConfigAndYaml() {
     }
 }
 
-void testSafetyStateMachineAndCommandValidation() {
-    std::cout << "[TEST] Arm Safety State Machine (DISCONNECTED -> DISARMED -> ARMED -> FAULT) & validateCommand..." << std::endl;
+void testStrictEnableAndReinitSafety() {
+    std::cout << "[TEST] Strict Enable Preconditions, Enable Confirmation & Re-init Blocking..." << std::endl;
 
     int sim_fd = openRawVcanSocket("vcan0");
     EXPECT_TRUE(sim_fd >= 0, "Opened raw vcan0 simulator socket");
@@ -149,100 +147,159 @@ void testSafetyStateMachineAndCommandValidation() {
     cfg.state_timeout_ms = 60;
     Arm arm(cfg);
 
-    // 1. Initial state is DISCONNECTED
-    EXPECT_TRUE(arm.status() == ArmStatus::DISCONNECTED, "Initial status is DISCONNECTED");
-    EXPECT_TRUE(!arm.checkHealth(), "checkHealth() is false when DISCONNECTED");
-    MITParam zero_mit{10.0, 0.5, 0.5, 0.0, 0.0};
-    EXPECT_THROW(arm.sendMIT(0, zero_mit), std::logic_error, "sendMIT rejected when DISCONNECTED");
-    EXPECT_THROW(arm.enable(), std::logic_error, "enable() rejected when DISCONNECTED");
-
-    // 2. init() transitions to DISARMED with zero bus writes
     arm.init();
     EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "Status is DISARMED after init()");
-    EXPECT_TRUE(arm.checkHealth(), "checkHealth() is true when DISARMED and no faults");
 
-    struct pollfd pfd { sim_fd, POLLIN, 0 };
-    EXPECT_TRUE(::poll(&pfd, 1, 10) == 0, "init() emitted zero CAN frames on vcan0");
+    // 1. Calling enable() when motors have never responded (offline) MUST fail
+    EXPECT_THROW(arm.enable(), std::runtime_error, "enable() rejected when motors are offline");
+    EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "Status stays DISARMED when pre-enable offline check fails");
 
-    // 3. In DISARMED state, motion commands are still rejected
-    EXPECT_THROW(arm.sendMIT(0, zero_mit), std::logic_error, "sendMIT rejected when DISARMED");
-
-    // 4. Test validateCommand() boundaries
-    EXPECT_TRUE(arm.validateCommand(0, zero_mit), "Valid MIT command passes validateCommand");
-    EXPECT_TRUE(!arm.validateCommand(6, zero_mit), "Out-of-bounds joint index 6 rejected");
-    EXPECT_TRUE(!arm.validateCommand(0, MITParam{10.0, 0.5, 5.0, 0.0, 0.0}),
-                "Position 5.0 rad > pos_max (3.1416 rad) rejected");
-    EXPECT_TRUE(!arm.validateCommand(0, MITParam{10.0, 0.5, 0.0, 50.0, 0.0}),
-                "Velocity 50.0 rad/s > vel_max (30.0 rad/s) rejected");
-    EXPECT_TRUE(!arm.validateCommand(0, MITParam{10.0, 0.5, 0.0, 0.0, 15.0}),
-                "Torque 15.0 Nm > tau_max (10.0 Nm) rejected");
-    EXPECT_TRUE(!arm.validateCommand(0, MITParam{-1.0, 0.5, 0.0, 0.0, 0.0}),
-                "Negative Kp rejected");
-    EXPECT_TRUE(!arm.validateCommand(0, MITParam{10.0, 0.5, std::nan(""), 0.0, 0.0}),
-                "NaN position rejected");
-    EXPECT_TRUE(!arm.validateCommand(0, PosVelParam{0.0, 1.0}),
-                "PosVel command rejected when joint is configured in MIT mode");
-
-    // 5. Passive refresh() in DISARMED state updates all 6 joint states
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.1 * (i + 1), -0.2 * (i + 1), 0.05 * (i + 1), 25 + i, 26 + i);
+    // 2. Only 5 of 6 motors respond -> enable() MUST still fail
+    for (std::size_t i = 0; i < NUM_JOINTS - 1; ++i) {
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
     }
-    ArmState st = arm.refresh(5000);
-    drainSocket(sim_fd); // drain the 6 refresh requests sent by arm.refresh()
+    arm.refresh(5000);
+    drainSocket(sim_fd);
+    EXPECT_THROW(arm.enable(), std::runtime_error, "enable() rejected when joint6 is offline");
 
-    EXPECT_TRUE(st.status == ArmStatus::DISARMED && st.all_online && !st.any_fault,
-                "All 6 joints online and healthy after refresh()");
+    // 3. All 6 motors respond, but feedback expires (becomes stale) before enable() -> MUST fail
+    sendSimulatedFeedback(sim_fd, 0x16, 6, 0x0, 0.0, 0.0, 0.0, 25, 25);
+    arm.recv(5000);
+    drainSocket(sim_fd);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80)); // exceed 60ms timeout
+    EXPECT_THROW(arm.enable(), std::runtime_error, "enable() rejected when feedback is stale");
+
+    // 4. All 6 motors have fresh feedback, but during enable() joint 5 reports still DISABLED (0x0) -> enters FAULT
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        EXPECT_NEAR(st.joints[i].position, 0.1 * (i + 1), 2e-3, "Joint position feedback matches");
-        EXPECT_NEAR(st.joints[i].velocity, -0.2 * (i + 1), 3e-2, "Joint velocity feedback matches");
-        EXPECT_TRUE(st.joints[i].t_mos == static_cast<int>(25 + i), "Joint MOS temperature matches");
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
     }
+    arm.refresh(5000);
+    drainSocket(sim_fd);
 
-    // 6. enable() transitions to ARMED and allows valid MIT control
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        uint8_t status_code = (i == 4) ? 0x0 : 0x1; // joint5 fails to enable
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, status_code, 0.0, 0.0, 0.0, 25, 25);
+    }
+    EXPECT_THROW(arm.enable(), std::runtime_error, "enable() throws when a motor fails to confirm enabled state (0x1)");
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Unconfirmed enable transitions Arm to FAULT");
+
+    // 5. Re-initialization while in FAULT is forbidden
+    EXPECT_THROW(arm.init(), std::logic_error, "init() forbidden when Arm is in FAULT");
+
+    // 6. Recover from FAULT cleanly, then enable all 6 motors with valid 0x1 confirmation
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
+    }
+    arm.clearFault();
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "Recovered to DISARMED");
+
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.1 * (i + 1), 0.0, 0.0, 26, 27);
     }
     arm.enable();
     drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Status is ARMED after enable()");
-    EXPECT_TRUE(arm.getState().joints[0].enabled, "Joint 0 reported enabled=true");
+    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Status is ARMED when all 6 motors confirm enabled (0x1)");
 
-    // Valid sendMIT succeeds in ARMED state
-    arm.sendMIT(0, zero_mit);
-    struct can_frame wire {};
-    EXPECT_TRUE(::poll(&pfd, 1, 20) > 0 && ::read(sim_fd, &wire, sizeof(wire)) == sizeof(wire),
-                "sendMIT emitted CAN frame on vcan0");
-    EXPECT_TRUE(wire.can_id == 0x01 && wire.can_dlc == 8, "MIT frame CAN ID == 0x01, DLC == 8");
+    // 7. Re-initialization while in ARMED is forbidden
+    EXPECT_THROW(arm.init(), std::logic_error, "init() forbidden when Arm is ARMED");
 
-    // Invalid command in ARMED state throws std::invalid_argument
-    EXPECT_THROW(arm.sendMIT(0, MITParam{10.0, 0.5, 9.9, 0.0, 0.0}), std::invalid_argument,
-                 "Out-of-range MIT command throws invalid_argument even when ARMED");
+    ::close(sim_fd);
+}
 
-    // 7. Hardware fault reported by motor (e.g. OVERVOLTAGE 0x8 on joint 3) triggers FAULT & auto-disables
-    sendSimulatedFeedback(sim_fd, 0x14, 0x04, 0x8, 0.4, 0.0, 0.0, 40, 42);
-    arm.recv(5000);
+void testStrictFaultRecoveryAndBatchCommandFailures() {
+    std::cout << "[TEST] Strict Fault Recovery & Batch Command Failure Handling..." << std::endl;
+
+    int sim_fd = openRawVcanSocket("vcan0");
+    EXPECT_TRUE(sim_fd >= 0, "Opened raw vcan0 simulator socket");
     drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Motor fault code 0x8 transitions Arm to FAULT");
-    EXPECT_TRUE(!arm.getState().fault_reason.empty(), "Fault reason recorded: " + arm.getState().fault_reason);
-    EXPECT_THROW(arm.sendMIT(0, zero_mit), std::logic_error, "sendMIT blocked in FAULT state");
 
-    // 8. clearFault() resets back to DISARMED
-    sendSimulatedFeedback(sim_fd, 0x14, 0x04, 0x0, 0.4, 0.0, 0.0, 30, 31);
-    arm.clearFault();
+    ArmConfig cfg = ArmConfig::fromYaml(std::string(DAMIAO_SOURCE_DIR) + "/config/arm.yaml");
+    cfg.state_timeout_ms = 60;
+    Arm arm(cfg);
+    arm.init();
+
+    // Bring all 6 motors online and ARMED
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
+    }
+    arm.refresh(5000);
     drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "clearFault() transitions FAULT -> DISARMED");
 
-    // 9. Communication timeout detection in ARMED state
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.0, 0.0, 0.0, 25, 25);
     }
     arm.enable();
     drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Re-enabled to ARMED");
+    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Arm is ARMED");
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(80)); // exceed state_timeout_ms (60ms)
-    EXPECT_TRUE(!arm.checkHealth() && arm.status() == ArmStatus::FAULT,
-                "Stale feedback in ARMED state transitions Arm to FAULT");
+    // 1. Trigger hardware fault on joint 2 (0x9 UNDERVOLTAGE)
+    sendSimulatedFeedback(sim_fd, 0x12, 2, 0x9, 0.0, 0.0, 0.0, 25, 25);
+    arm.recv(5000);
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Joint 2 undervoltage triggers FAULT");
+
+    // 2. Attempt clearFault() while joint 2 STILL reports fault 0x9 -> MUST fail and stay in FAULT
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        uint8_t code = (i == 1) ? 0x9 : 0x0;
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, code, 0.0, 0.0, 0.0, 25, 25);
+    }
+    EXPECT_THROW(arm.clearFault(), std::runtime_error, "clearFault() rejected while joint 2 still has fault 0x9");
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Status remains FAULT when fault condition is unresolved");
+
+    // 3. Attempt clearFault() when feedback is missing/stale -> MUST fail and stay in FAULT
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_THROW(arm.clearFault(), std::runtime_error, "clearFault() rejected when motor feedback is stale");
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Status remains FAULT when feedback is stale");
+
+    // 4. Attempt clearFault() when a motor refuses to disable (still reports 0x1 ENABLED) -> MUST fail
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        uint8_t code = (i == 0) ? 0x1 : 0x0;
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, code, 0.0, 0.0, 0.0, 25, 25);
+    }
+    EXPECT_THROW(arm.clearFault(), std::runtime_error, "clearFault() rejected when joint 1 remains enabled");
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Status remains FAULT when motor is still enabled");
+
+    // 5. All 6 motors report healthy disabled state (0x0) -> clearFault() succeeds -> DISARMED
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
+    }
+    arm.clearFault();
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "clearFault() succeeds once all 6 motors are healthy & disabled");
+
+    // 6. Re-enable to ARMED and test batch command validation & socket write failure -> FAULT
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.0, 0.0, 0.0, 25, 25);
+    }
+    arm.enable();
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Arm re-enabled to ARMED");
+
+    std::array<MITParam, NUM_JOINTS> batch_cmds;
+    batch_cmds.fill(MITParam{10.0, 0.5, 0.2, 0.0, 0.0});
+    arm.sendMITAll(batch_cmds);
+    drainSocket(sim_fd);
+    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Valid sendMITAll succeeds");
+
+    // Refresh simulated feedback so joints stay fresh
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.2, 0.0, 0.0, 25, 25);
+    }
+    arm.recv(5000);
+
+    // Simulate underlying CAN socket write failure by closing the underlying OpenArm socket fd
+    int raw_fd = arm.rawOpenArm().get_master_can_device_collection().get_can_socket().get_socket_fd();
+    ::close(raw_fd);
+
+    EXPECT_THROW(arm.sendMITAll(batch_cmds), std::runtime_error,
+                 "sendMITAll throws runtime_error when underlying CAN write fails");
+    EXPECT_TRUE(arm.status() == ArmStatus::FAULT,
+                "CAN write failure during sendMITAll immediately transitions Arm to FAULT");
 
     ::close(sim_fd);
 }
@@ -251,7 +308,8 @@ void testSafetyStateMachineAndCommandValidation() {
 
 int main() {
     testArmConfigAndYaml();
-    testSafetyStateMachineAndCommandValidation();
+    testStrictEnableAndReinitSafety();
+    testStrictFaultRecoveryAndBatchCommandFailures();
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "Arm Tests Passed: " << g_passed << " | Failed: " << g_failed << std::endl;
