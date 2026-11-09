@@ -63,3 +63,12 @@ ctest --test-dir build --output-on-failure
 ./build/damiao_socketcan_bridge --socketcan vcan0 --serial /dev/ttyACM0 --read-only &
 ./build/openarm_single_motor_test --interface vcan0 --samples 500 --period-ms 2
 ```
+
+## Arm 安全行为
+
+- `disable()` 在 50 ms 内等待六轴的新鲜失能反馈，并检查总线、故障码和 enabled 状态；写入失败、缺失反馈或仍使能均锁定 `FAULT` 并抛异常，不会报告 `DISARMED`。原有 `FAULT` 不由 `disable()` 清除。
+- 使能、失能和故障恢复共用 50 ms 状态握手：不仅等待响应计数增长，还等待期望的 enabled 状态，避免在较早的排队反馈到达后提前结束握手。
+- `ARMED` 时后台线程每 `min(100 ms, state_timeout_ms / 3)` 查询六轴状态（最小 1 ms）。上层可以不发运动命令、不调用 `recv()`；后台持续接收反馈，过期或硬件故障进入 `FAULT`。不提供轨迹保持或电机看门狗喂送。
+- SDK 状态访问与收发共用一把锁；后台只在 `ARMED` 工作，初始化保持只读。不要在控制循环中调用长时间阻塞的 `recv()`；这会推迟后台查询。
+- `rawOpenArm()` 只用于非 ARMED 状态的单线程诊断；不得保留引用后跨使能使用或并发操作底层对象。
+- 析构停止监控线程，再尽力执行确认失能；断线时不能保证物理停机。信号终止、崩溃及断电不保证运行析构，实际机械臂仍须硬件急停与电机通信超时保护。

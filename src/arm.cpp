@@ -193,15 +193,22 @@ Arm::Arm(const ArmConfig& config) : config_(config) {
 }
 
 Arm::~Arm() noexcept {
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        stopping_ = true;
+        monitor_cv_.notify_all();
+    }
+    if (monitor_.joinable()) monitor_.join();
     if (openarm_ && status_ == ArmStatus::ARMED) {
         try {
-            openarm_->disable_all();
+            disable();
         } catch (...) {
         }
     }
 }
 
 void Arm::init() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     // 禁止危险重初始化：ARMED 和 FAULT 状态不能直接重新 init()
     if (status_ == ArmStatus::ARMED || status_ == ArmStatus::FAULT) {
         throw std::logic_error("Arm::init: forbidden while arm status is " +
@@ -236,14 +243,30 @@ void Arm::init() {
                 break;
             }
         }
-        responses_at_last_cmd_[i] = 0;
-        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
     }
 
     status_ = ArmStatus::DISARMED;
     state_.status = status_;
     state_.fault_reason.clear();
     syncStateFromOpenArm();
+    if (!monitor_.joinable()) monitor_ = std::thread(&Arm::monitorLoop, this);
+}
+
+void Arm::monitorLoop() {
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    // At least three checks per freshness window; no control commands are needed while idle.
+    const auto period = std::chrono::milliseconds(
+        std::max(1u, std::min(100u, config_.state_timeout_ms / 3)));
+    while (!monitor_cv_.wait_for(lock, period, [this] { return stopping_; })) {
+        if (status_ != ArmStatus::ARMED) continue;
+        try {
+            if (checkHealth()) refresh(0);
+        } catch (const std::exception& e) {
+            enterFault(e.what());
+        } catch (...) {
+            enterFault("State monitor failed");
+        }
+    }
 }
 
 int Arm::resolveDeviceIndex(std::size_t joint_idx) const {
@@ -254,7 +277,7 @@ int Arm::resolveDeviceIndex(std::size_t joint_idx) const {
 }
 
 bool Arm::pollUntilAllJointsRespond(const std::array<uint64_t, NUM_JOINTS>& baseline_responses,
-                                    int total_timeout_ms) {
+                                    int total_timeout_ms, bool expected_enabled) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(total_timeout_ms);
     int slice_us = std::max(500, std::min(config_.recv_timeout_us, 2000));
 
@@ -264,7 +287,8 @@ bool Arm::pollUntilAllJointsRespond(const std::array<uint64_t, NUM_JOINTS>& base
         bool all_replied = true;
         for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
             const auto& link = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]);
-            if (link.responses <= baseline_responses[i]) {
+            const auto motor = openarm_->get_arm().get_motor(joint_to_dev_idx_[i]);
+            if (link.responses <= baseline_responses[i] || motor.is_enabled() != expected_enabled || motor.has_error()) {
                 all_replied = false;
                 break;
             }
@@ -315,11 +339,6 @@ void Arm::syncStateFromOpenArm() {
         js.online = link.ever_responded();
         js.stale = link.is_stale(timeout);
 
-        // 若已收到最后一次指令后的新回复，清除未应答指令计时
-        if (link.responses > responses_at_last_cmd_[i]) {
-            last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
-        }
-
         if (!js.online || js.stale) {
             all_online = false;
         }
@@ -336,6 +355,7 @@ void Arm::syncStateFromOpenArm() {
 }
 
 void Arm::enterFault(const std::string& reason) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     status_ = ArmStatus::FAULT;
     state_.status = ArmStatus::FAULT;
     state_.fault_reason = reason;
@@ -350,6 +370,7 @@ void Arm::enterFault(const std::string& reason) {
 }
 
 bool Arm::checkHealth() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         return false;
     }
@@ -367,9 +388,6 @@ bool Arm::checkHealth() {
         return false;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    const auto timeout = std::chrono::milliseconds(config_.state_timeout_ms);
-
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         const auto& js = state_.joints[i];
         if (js.has_fault) {
@@ -386,11 +404,7 @@ bool Arm::checkHealth() {
                 enterFault("Motor unexpectedly disabled on " + config_.joints[i].name);
                 return false;
             }
-            // 仅当已发出的控制/刷新指令超时未收到电机回复时，才判定通信超时
-            bool has_unanswered_cmd =
-                (last_unanswered_cmd_time_[i] != std::chrono::steady_clock::time_point{}) &&
-                ((now - last_unanswered_cmd_time_[i]) > timeout);
-            if (has_unanswered_cmd) {
+            if (js.stale) {
                 enterFault("Communication timeout on " + config_.joints[i].name);
                 return false;
             }
@@ -401,6 +415,7 @@ bool Arm::checkHealth() {
 }
 
 void Arm::enable() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         throw std::logic_error("Arm::enable: arm is DISCONNECTED, call init() first");
     }
@@ -467,8 +482,7 @@ void Arm::enable() {
     }
 
     // 轮询等待全部 6 台电机返回使能后的状态帧（兼容 USB-CAN 桥接下 6 台电机串行回传延迟）
-    int handshake_timeout_ms = std::max(20, static_cast<int>(config_.recv_timeout_us / 1000) * 10);
-    pollUntilAllJointsRespond(prev_responses, handshake_timeout_ms);
+    pollUntilAllJointsRespond(prev_responses, 50, true);
     syncStateFromOpenArm();
 
     // 确认六台电机全部返回了使能后的新反馈、无故障且均已进入 enabled (0x1) 状态
@@ -482,8 +496,6 @@ void Arm::enable() {
             enterFault("Arm::enable: joint " + config_.joints[i].name + " did not confirm enabled state");
             throw std::runtime_error(state_.fault_reason);
         }
-        responses_at_last_cmd_[i] = js.responses;
-        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
     }
 
     status_ = ArmStatus::ARMED;
@@ -491,26 +503,35 @@ void Arm::enable() {
 }
 
 void Arm::disable() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         return;
     }
+    // Drain queued feedback before taking the confirmation baseline.
+    openarm_->recv_all(0);
     std::array<uint64_t, NUM_JOINTS> prev_responses{};
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
-        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
     }
-
+    const auto writes = openarm_->get_bus_status().writes_ok;
     openarm_->disable_all();
-    int handshake_timeout_ms = std::max(10, static_cast<int>(config_.recv_timeout_us / 1000) * 5);
-    pollUntilAllJointsRespond(prev_responses, handshake_timeout_ms);
-
-    if (status_ != ArmStatus::FAULT) {
-        status_ = ArmStatus::DISARMED;
-    }
+    const bool written = openarm_->get_bus_status().writes_ok == writes + NUM_JOINTS;
+    const bool replied = pollUntilAllJointsRespond(prev_responses, 50, false);
     syncStateFromOpenArm();
+    bool confirmed = written && replied && state_.bus_healthy;
+    for (const auto& joint : state_.joints) {
+        confirmed = confirmed && joint.online && !joint.stale && !joint.enabled && !joint.has_fault;
+    }
+    if (!confirmed) {
+        enterFault("Arm::disable: failed to confirm fresh disabled feedback from all joints");
+        throw std::runtime_error(state_.fault_reason);
+    }
+    if (status_ != ArmStatus::FAULT) status_ = ArmStatus::DISARMED;
+    state_.status = status_;
 }
 
 void Arm::clearFault() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         throw std::logic_error("Arm::clearFault: arm is DISCONNECTED");
     }
@@ -530,8 +551,7 @@ void Arm::clearFault() {
         throw std::runtime_error(state_.fault_reason);
     }
 
-    int handshake_timeout_ms = std::max(20, static_cast<int>(config_.recv_timeout_us / 1000) * 10);
-    pollUntilAllJointsRespond(prev_responses, handshake_timeout_ms);
+    pollUntilAllJointsRespond(prev_responses, 50, false);
     syncStateFromOpenArm();
 
     if (!state_.bus_healthy) {
@@ -556,8 +576,6 @@ void Arm::clearFault() {
                        " failed to confirm disabled state");
             throw std::runtime_error(state_.fault_reason);
         }
-        responses_at_last_cmd_[i] = js.responses;
-        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
     }
 
     status_ = ArmStatus::DISARMED;
@@ -566,16 +584,9 @@ void Arm::clearFault() {
 }
 
 ArmState Arm::refresh(int timeout_us) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         throw std::logic_error("Arm::refresh: arm is DISCONNECTED");
-    }
-    const auto now = std::chrono::steady_clock::now();
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        uint64_t cur_resp = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
-        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
-            responses_at_last_cmd_[i] = cur_resp;
-            last_unanswered_cmd_time_[i] = now;
-        }
     }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
@@ -589,6 +600,7 @@ ArmState Arm::refresh(int timeout_us) {
 }
 
 void Arm::recv(int timeout_us) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         throw std::logic_error("Arm::recv: arm is DISCONNECTED");
     }
@@ -698,6 +710,7 @@ void Arm::verifySendSucceeded(const char* api_name,
 }
 
 void Arm::sendMIT(std::size_t joint_idx, const MITParam& cmd) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (status_ != ArmStatus::ARMED) {
         throw std::logic_error("Arm::sendMIT: rejected, arm status is " + std::string(toString(status_)));
     }
@@ -708,10 +721,6 @@ void Arm::sendMIT(std::size_t joint_idx, const MITParam& cmd) {
         throw std::invalid_argument("Arm::sendMIT: invalid MIT command on joint " + std::to_string(joint_idx));
     }
 
-    if (last_unanswered_cmd_time_[joint_idx] == std::chrono::steady_clock::time_point{}) {
-        responses_at_last_cmd_[joint_idx] = state_.joints[joint_idx].responses;
-        last_unanswered_cmd_time_[joint_idx] = std::chrono::steady_clock::now();
-    }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
@@ -722,6 +731,7 @@ void Arm::sendMIT(std::size_t joint_idx, const MITParam& cmd) {
 }
 
 void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (status_ != ArmStatus::ARMED) {
         throw std::logic_error("Arm::sendMITAll: rejected, arm status is " + std::string(toString(status_)));
     }
@@ -732,13 +742,6 @@ void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds) {
         throw std::invalid_argument("Arm::sendMITAll: invalid MIT commands");
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
-            responses_at_last_cmd_[i] = state_.joints[i].responses;
-            last_unanswered_cmd_time_[i] = now;
-        }
-    }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
@@ -751,6 +754,7 @@ void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds) {
 }
 
 void Arm::sendPosVel(std::size_t joint_idx, const PosVelParam& cmd) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (status_ != ArmStatus::ARMED) {
         throw std::logic_error("Arm::sendPosVel: rejected, arm status is " + std::string(toString(status_)));
     }
@@ -761,10 +765,6 @@ void Arm::sendPosVel(std::size_t joint_idx, const PosVelParam& cmd) {
         throw std::invalid_argument("Arm::sendPosVel: invalid PosVel command on joint " + std::to_string(joint_idx));
     }
 
-    if (last_unanswered_cmd_time_[joint_idx] == std::chrono::steady_clock::time_point{}) {
-        responses_at_last_cmd_[joint_idx] = state_.joints[joint_idx].responses;
-        last_unanswered_cmd_time_[joint_idx] = std::chrono::steady_clock::now();
-    }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
@@ -775,6 +775,7 @@ void Arm::sendPosVel(std::size_t joint_idx, const PosVelParam& cmd) {
 }
 
 void Arm::sendPosVelAll(const std::array<PosVelParam, NUM_JOINTS>& cmds) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (status_ != ArmStatus::ARMED) {
         throw std::logic_error("Arm::sendPosVelAll: rejected, arm status is " + std::string(toString(status_)));
     }
@@ -785,13 +786,6 @@ void Arm::sendPosVelAll(const std::array<PosVelParam, NUM_JOINTS>& cmds) {
         throw std::invalid_argument("Arm::sendPosVelAll: invalid PosVel commands");
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
-            responses_at_last_cmd_[i] = state_.joints[i].responses;
-            last_unanswered_cmd_time_[i] = now;
-        }
-    }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
@@ -804,6 +798,7 @@ void Arm::sendPosVelAll(const std::array<PosVelParam, NUM_JOINTS>& cmds) {
 }
 
 void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (status_ != ArmStatus::ARMED) {
         throw std::logic_error("Arm::sendVel: rejected, arm status is " + std::string(toString(status_)));
     }
@@ -814,10 +809,6 @@ void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
         throw std::invalid_argument("Arm::sendVel: invalid Vel command on joint " + std::to_string(joint_idx));
     }
 
-    if (last_unanswered_cmd_time_[joint_idx] == std::chrono::steady_clock::time_point{}) {
-        responses_at_last_cmd_[joint_idx] = state_.joints[joint_idx].responses;
-        last_unanswered_cmd_time_[joint_idx] = std::chrono::steady_clock::now();
-    }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
@@ -828,6 +819,7 @@ void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
 }
 
 void Arm::sendVelAll(const std::array<VelParam, NUM_JOINTS>& cmds) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (status_ != ArmStatus::ARMED) {
         throw std::logic_error("Arm::sendVelAll: rejected, arm status is " + std::string(toString(status_)));
     }
@@ -838,13 +830,6 @@ void Arm::sendVelAll(const std::array<VelParam, NUM_JOINTS>& cmds) {
         throw std::invalid_argument("Arm::sendVelAll: invalid Vel commands");
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
-            responses_at_last_cmd_[i] = state_.joints[i].responses;
-            last_unanswered_cmd_time_[i] = now;
-        }
-    }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
@@ -857,6 +842,10 @@ void Arm::sendVelAll(const std::array<VelParam, NUM_JOINTS>& cmds) {
 }
 
 openarm::can::socket::OpenArm& Arm::rawOpenArm() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (status_ == ArmStatus::ARMED) {
+        throw std::logic_error("Arm::rawOpenArm: disable arm before direct diagnostic access");
+    }
     if (!openarm_) {
         throw std::logic_error("Arm::rawOpenArm: arm is not initialized");
     }

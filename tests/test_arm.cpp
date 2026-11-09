@@ -2,6 +2,7 @@
 #include "damiao_arm_sdk/types.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -213,117 +214,114 @@ void testStrictEnableAndReinitSafety() {
 }
 
 void testStrictFaultRecoveryAndBatchCommandFailures() {
-    std::cout << "[TEST] Strict Fault Recovery, Idle Hold Tolerance & Batch Command Failure Handling..." << std::endl;
+    std::cout << "[TEST] Confirmed disable and autonomous idle monitoring..." << std::endl;
+    const int fd = openRawVcanSocket();
+    if (fd < 0) throw std::runtime_error("Cannot open simulator socket");
+    std::atomic<bool> running{true};
+    std::atomic<int> missing{0}, stuck{0}, fault{0};
+    std::atomic<unsigned> queries{0}, motions{0};
+    std::thread simulator([&] {
+        std::array<bool, NUM_JOINTS> enabled{};
+        while (running.load()) {
+            pollfd pfd{fd, POLLIN, 0};
+            if (::poll(&pfd, 1, 2) <= 0) continue;
+            can_frame request{};
+            if (::read(fd, &request, sizeof(request)) != sizeof(request)) continue;
+            unsigned id = request.can_id;
+            if (id == 0x7FF && request.data[2] == 0xCC) {
+                id = request.data[0] | (request.data[1] << 8);
+                ++queries;
+            } else if (id >= 1 && id <= NUM_JOINTS && request.data[7] == 0xFC) {
+                enabled[id - 1] = true;
+            } else if (id >= 1 && id <= NUM_JOINTS && request.data[7] == 0xFD) {
+                if (stuck.load() != static_cast<int>(id)) enabled[id - 1] = false;
+            } else {
+                ++motions;
+                continue;
+            }
+            if (id < 1 || id > NUM_JOINTS || missing.load() == static_cast<int>(id)) continue;
+            // Build a valid reply without touching assertion counters from the worker.
+            can_frame reply{};
+            reply.can_id = 0x10 + id;
+            reply.can_dlc = 8;
+            const unsigned code = fault.load() == static_cast<int>(id) ? 9 : enabled[id - 1];
+            reply.data[0] = (code << 4) | id;
+            reply.data[1] = 0x80;
+            reply.data[3] = 0x80;
+            reply.data[4] = 0x08;
+            reply.data[6] = reply.data[7] = 25;
+            // Stagger replies beyond the old single-receive window.
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (::write(fd, &reply, sizeof(reply)) != sizeof(reply)) running = false;
+        }
+    });
+    try {
+        auto cfg = ArmConfig::defaultJ4310SixAxis();
+        cfg.state_timeout_ms = 150;
+        Arm arm(cfg);
+        arm.init();
+        auto bringOnline = [&] {
+            arm.refresh(5000);
+            for (int i = 0; i < 6; ++i) arm.recv(5000);
+        };
+        auto waitStatus = [&](ArmStatus expected) {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (arm.status() != expected && std::chrono::steady_clock::now() < end)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            return arm.status() == expected;
+        };
+        bringOnline();
+        arm.enable();
+        const auto before = arm.getState().joints[5].responses;
+        const auto q = queries.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Idle arm remains armed with valid query replies");
+        EXPECT_TRUE(queries.load() >= q + 12 && motions.load() == 0,
+                    "Idle monitor queries repeatedly without sending motion commands");
+        EXPECT_TRUE(arm.getState().joints[5].responses > before && !arm.getState().joints[5].stale,
+                    "Idle monitor consumes fresh feedback without caller recv");
+        arm.disable();
+        EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "Delayed six-axis disable confirmation succeeds");
+        for (const auto& joint : arm.getState().joints)
+            EXPECT_TRUE(!joint.enabled && !joint.stale, "Every joint confirmed disabled");
 
-    int sim_fd = openRawVcanSocket("vcan0");
-    EXPECT_TRUE(sim_fd >= 0, "Opened raw vcan0 simulator socket");
-    drainSocket(sim_fd);
-
-    ArmConfig cfg = ArmConfig::fromYaml(std::string(DAMIAO_SOURCE_DIR) + "/config/arm.yaml");
-    cfg.state_timeout_ms = 60;
-    Arm arm(cfg);
-    arm.init();
-
-    // Bring all 6 motors online and ARMED
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
+        bringOnline();
+        arm.enable();
+        stuck = 3;
+        EXPECT_THROW(arm.disable(), std::runtime_error, "Still-enabled joint rejects disable");
+        EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Unconfirmed disable latches FAULT");
+        stuck = 0;
+        arm.clearFault();
+        bringOnline();
+        arm.enable();
+        missing = 6;
+        EXPECT_THROW(arm.disable(), std::runtime_error, "Missing disable feedback rejects disable");
+        EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Missing confirmation cannot report DISARMED");
+        missing = 0;
+        arm.clearFault();
+        bringOnline();
+        arm.enable();
+        missing = 2;
+        EXPECT_TRUE(waitStatus(ArmStatus::FAULT), "Idle disconnect faults autonomously without caller polling");
+        EXPECT_THROW(arm.clearFault(), std::runtime_error, "Offline joint prevents fault recovery");
+        missing = 0;
+        arm.clearFault();
+        bringOnline();
+        arm.enable();
+        fault = 4;
+        EXPECT_TRUE(waitStatus(ArmStatus::FAULT), "Idle hardware fault is detected autonomously");
+        EXPECT_THROW(arm.clearFault(), std::runtime_error, "Active hardware fault prevents recovery");
+        fault = 0;
+        arm.clearFault();
+    } catch (...) {
+        running = false;
+        simulator.join();
+        ::close(fd);
+        throw;
     }
-    arm.refresh(5000);
-    drainSocket(sim_fd);
-
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.0, 0.0, 0.0, 25, 25);
-    }
-    arm.enable();
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Arm is ARMED");
-
-    // 1. Trigger hardware fault on joint 2 (0x9 UNDERVOLTAGE)
-    sendSimulatedFeedback(sim_fd, 0x12, 2, 0x9, 0.0, 0.0, 0.0, 25, 25);
-    arm.recv(5000);
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Joint 2 undervoltage triggers FAULT");
-
-    // 2. Attempt clearFault() while joint 2 STILL reports fault 0x9 -> MUST fail and stay in FAULT
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        uint8_t code = (i == 1) ? 0x9 : 0x0;
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, code, 0.0, 0.0, 0.0, 25, 25);
-    }
-    EXPECT_THROW(arm.clearFault(), std::runtime_error, "clearFault() rejected while joint 2 still has fault 0x9");
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Status remains FAULT when fault condition is unresolved");
-
-    // 3. Attempt clearFault() when feedback is missing -> MUST fail and stay in FAULT
-    EXPECT_THROW(arm.clearFault(), std::runtime_error, "clearFault() rejected when motor does not reply to disable");
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Status remains FAULT when motor does not reply");
-
-    // 4. Attempt clearFault() when a motor refuses to disable (still reports 0x1 ENABLED) -> MUST fail
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        uint8_t code = (i == 0) ? 0x1 : 0x0;
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, code, 0.0, 0.0, 0.0, 25, 25);
-    }
-    EXPECT_THROW(arm.clearFault(), std::runtime_error, "clearFault() rejected when joint 1 remains enabled");
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Status remains FAULT when motor is still enabled");
-
-    // 5. All 6 motors report healthy disabled state (0x0) -> clearFault() succeeds -> DISARMED
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
-    }
-    arm.clearFault();
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "clearFault() succeeds once all 6 motors are healthy & disabled");
-
-    // 6. Re-enable to ARMED and verify idle hold > state_timeout_ms does NOT falsely trip FAULT
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.0, 0.0, 0.0, 25, 25);
-    }
-    arm.enable();
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Arm re-enabled to ARMED");
-
-    // Wait 80ms (> 60ms state_timeout_ms) with no commands sent (idle hold); next command should still succeed!
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    std::array<MITParam, NUM_JOINTS> batch_cmds;
-    batch_cmds.fill(MITParam{10.0, 0.5, 0.2, 0.0, 0.0});
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.2, 0.0, 0.0, 25, 25);
-    }
-    arm.sendMITAll(batch_cmds); // auto-drains the feedback via recv_all(0)
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "sendMITAll after idle pause succeeds and auto-drains replies");
-
-    // 7. Verify true communication timeout: sendMITAll with NO motor reply for > 60ms triggers FAULT on next check/send
-    arm.sendMITAll(batch_cmds);
-    drainSocket(sim_fd);
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    EXPECT_THROW(arm.sendMITAll(batch_cmds), std::runtime_error,
-                 "sendMITAll throws when previous command went unanswered beyond state_timeout_ms");
-    drainSocket(sim_fd);
-    EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Unanswered command timeout transitions Arm to FAULT");
-
-    // Recover and test underlying CAN socket write failure -> FAULT
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
-    }
-    arm.clearFault();
-    drainSocket(sim_fd);
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x1, 0.0, 0.0, 0.0, 25, 25);
-    }
-    arm.enable();
-    drainSocket(sim_fd);
-
-    int raw_fd = arm.rawOpenArm().get_master_can_device_collection().get_can_socket().get_socket_fd();
-    ::close(raw_fd);
-
-    EXPECT_THROW(arm.sendMITAll(batch_cmds), std::runtime_error,
-                 "sendMITAll throws runtime_error when underlying CAN write fails");
-    EXPECT_TRUE(arm.status() == ArmStatus::FAULT,
-                "CAN write failure during sendMITAll immediately transitions Arm to FAULT");
-
-    ::close(sim_fd);
+    running = false;
+    simulator.join();
+    ::close(fd);
 }
 
 } // namespace
