@@ -192,8 +192,17 @@ Arm::Arm(const ArmConfig& config) : config_(config) {
     }
 }
 
+Arm::~Arm() noexcept {
+    if (openarm_ && status_ == ArmStatus::ARMED) {
+        try {
+            openarm_->disable_all();
+        } catch (...) {
+        }
+    }
+}
+
 void Arm::init() {
-    // 3. 禁止危险重初始化：ARMED 和 FAULT 状态不能直接重新 init()
+    // 禁止危险重初始化：ARMED 和 FAULT 状态不能直接重新 init()
     if (status_ == ArmStatus::ARMED || status_ == ArmStatus::FAULT) {
         throw std::logic_error("Arm::init: forbidden while arm status is " +
                                std::string(toString(status_)) +
@@ -214,7 +223,7 @@ void Arm::init() {
 
     openarm_ = std::make_unique<openarm::can::socket::OpenArm>(config_.can_interface, config_.enable_fd);
 
-    // P0 安全：初始化时不传 control_modes，避免在只读初始化阶段向电机写寄存器 (0x55)
+    // 初始化时不传 control_modes，避免在只读初始化阶段向电机写寄存器 (0x55)
     openarm_->init_arm_motors(types, send_ids, recv_ids);
     openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
 
@@ -227,6 +236,8 @@ void Arm::init() {
                 break;
             }
         }
+        responses_at_last_cmd_[i] = 0;
+        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
     }
 
     status_ = ArmStatus::DISARMED;
@@ -242,12 +253,38 @@ int Arm::resolveDeviceIndex(std::size_t joint_idx) const {
     return joint_to_dev_idx_[joint_idx];
 }
 
+bool Arm::pollUntilAllJointsRespond(const std::array<uint64_t, NUM_JOINTS>& baseline_responses,
+                                    int total_timeout_ms) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(total_timeout_ms);
+    int slice_us = std::max(500, std::min(config_.recv_timeout_us, 2000));
+
+    while (true) {
+        openarm_->recv_all(slice_us);
+
+        bool all_replied = true;
+        for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+            const auto& link = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]);
+            if (link.responses <= baseline_responses[i]) {
+                all_replied = false;
+                break;
+            }
+        }
+        if (all_replied) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+    }
+}
+
 void Arm::syncStateFromOpenArm() {
     if (!openarm_) {
         state_.status = ArmStatus::DISCONNECTED;
         return;
     }
 
+    const auto now = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::milliseconds(config_.state_timeout_ms);
     bool all_online = true;
     bool any_fault = false;
@@ -278,6 +315,11 @@ void Arm::syncStateFromOpenArm() {
         js.online = link.ever_responded();
         js.stale = link.is_stale(timeout);
 
+        // 若已收到最后一次指令后的新回复，清除未应答指令计时
+        if (link.responses > responses_at_last_cmd_[i]) {
+            last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
+        }
+
         if (!js.online || js.stale) {
             all_online = false;
         }
@@ -290,7 +332,7 @@ void Arm::syncStateFromOpenArm() {
     state_.all_online = all_online;
     state_.any_fault = any_fault;
     state_.status = status_;
-    state_.timestamp = std::chrono::steady_clock::now();
+    state_.timestamp = now;
 }
 
 void Arm::enterFault(const std::string& reason) {
@@ -312,6 +354,8 @@ bool Arm::checkHealth() {
         return false;
     }
 
+    // 先非阻塞排空底层已到达的 CAN 反馈帧，避免因上层未及时调用 recv() 造成假性超时
+    openarm_->recv_all(0);
     syncStateFromOpenArm();
 
     if (status_ == ArmStatus::FAULT) {
@@ -323,6 +367,9 @@ bool Arm::checkHealth() {
         return false;
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::milliseconds(config_.state_timeout_ms);
+
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         const auto& js = state_.joints[i];
         if (js.has_fault) {
@@ -330,14 +377,21 @@ bool Arm::checkHealth() {
                        " (code=" + std::to_string(js.error_code) + ")");
             return false;
         }
-        // 在已使能 (ARMED) 状态下，所有电机必须保持在线、有新鲜反馈且处于 enabled 状态
         if (status_ == ArmStatus::ARMED) {
-            if (!js.online || js.stale) {
-                enterFault("Communication timeout on " + config_.joints[i].name);
+            if (!js.online) {
+                enterFault("Motor offline on " + config_.joints[i].name);
                 return false;
             }
             if (!js.enabled) {
                 enterFault("Motor unexpectedly disabled on " + config_.joints[i].name);
+                return false;
+            }
+            // 仅当已发出的控制/刷新指令超时未收到电机回复时，才判定通信超时
+            bool has_unanswered_cmd =
+                (last_unanswered_cmd_time_[i] != std::chrono::steady_clock::time_point{}) &&
+                ((now - last_unanswered_cmd_time_[i]) > timeout);
+            if (has_unanswered_cmd) {
+                enterFault("Communication timeout on " + config_.joints[i].name);
                 return false;
             }
         }
@@ -354,7 +408,7 @@ void Arm::enable() {
         throw std::logic_error("Arm::enable: arm is in FAULT (" + state_.fault_reason + "), call clearFault() first");
     }
 
-    // 1. 严格使能前检查：六台电机必须全部在线、有新鲜反馈且无故障
+    // 1. 使能前检查：六台电机必须全部在线、有新鲜反馈且无故障
     syncStateFromOpenArm();
     if (!state_.bus_healthy) {
         enterFault("Arm::enable: CAN bus unhealthy before enable");
@@ -373,23 +427,37 @@ void Arm::enable() {
         }
     }
 
-    // 若配置了非 MIT 模式，在使能前同步对应关节的控制模式并检查写入成功
+    // 若配置了非 MIT 模式，在 PARAM 回调模式下同步对应关节的控制模式并排空寄存器应答帧
+    bool any_non_mit = false;
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         if (config_.joints[i].control_mode != ControlMode::MIT) {
-            uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
-            openarm_->get_arm().set_control_mode_one(resolveDeviceIndex(i), config_.joints[i].control_mode);
-            if (openarm_->get_bus_status().writes_ok != prev_writes + 1) {
-                enterFault("Arm::enable: failed to write control mode on " + config_.joints[i].name);
-                throw std::runtime_error(state_.fault_reason);
+            any_non_mit = true;
+            break;
+        }
+    }
+    if (any_non_mit) {
+        openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::PARAM);
+        for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+            if (config_.joints[i].control_mode != ControlMode::MIT) {
+                uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
+                openarm_->get_arm().set_control_mode_one(resolveDeviceIndex(i), config_.joints[i].control_mode);
+                if (openarm_->get_bus_status().writes_ok != prev_writes + 1) {
+                    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
+                    enterFault("Arm::enable: failed to write control mode on " + config_.joints[i].name);
+                    throw std::runtime_error(state_.fault_reason);
+                }
             }
         }
+        openarm_->recv_all(config_.recv_timeout_us);
+        openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
+        syncStateFromOpenArm();
     }
 
     // 发送使能指令并检查 6 帧全部成功写入 SocketCAN
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint64_t, NUM_JOINTS> prev_responses{};
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        prev_responses[i] = state_.joints[i].responses;
+        prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
     }
 
     openarm_->enable_all();
@@ -398,7 +466,9 @@ void Arm::enable() {
         throw std::runtime_error(state_.fault_reason);
     }
 
-    openarm_->recv_all(config_.recv_timeout_us);
+    // 轮询等待全部 6 台电机返回使能后的状态帧（兼容 USB-CAN 桥接下 6 台电机串行回传延迟）
+    int handshake_timeout_ms = std::max(20, static_cast<int>(config_.recv_timeout_us / 1000) * 10);
+    pollUntilAllJointsRespond(prev_responses, handshake_timeout_ms);
     syncStateFromOpenArm();
 
     // 确认六台电机全部返回了使能后的新反馈、无故障且均已进入 enabled (0x1) 状态
@@ -412,6 +482,8 @@ void Arm::enable() {
             enterFault("Arm::enable: joint " + config_.joints[i].name + " did not confirm enabled state");
             throw std::runtime_error(state_.fault_reason);
         }
+        responses_at_last_cmd_[i] = js.responses;
+        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
     }
 
     status_ = ArmStatus::ARMED;
@@ -422,8 +494,15 @@ void Arm::disable() {
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         return;
     }
+    std::array<uint64_t, NUM_JOINTS> prev_responses{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
+        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
+    }
+
     openarm_->disable_all();
-    openarm_->recv_all(config_.recv_timeout_us);
+    int handshake_timeout_ms = std::max(10, static_cast<int>(config_.recv_timeout_us / 1000) * 5);
+    pollUntilAllJointsRespond(prev_responses, handshake_timeout_ms);
 
     if (status_ != ArmStatus::FAULT) {
         status_ = ArmStatus::DISARMED;
@@ -436,9 +515,14 @@ void Arm::clearFault() {
         throw std::logic_error("Arm::clearFault: arm is DISCONNECTED");
     }
 
-    // 2. 严格故障恢复：先清除总线错误计数并发送失能指令刷新全部电机状态，
-    // 若故障条件（总线异常、电机离线/反馈过期、电机硬件故障或仍处于使能）未消除，禁止退出 FAULT！
+    // 故障恢复：先清除总线错误计数并发送失能指令刷新全部电机状态，
+    // 若故障条件（总线异常、电机离线/反馈过期、电机硬件故障或仍处于使能）未消除，禁止退出 FAULT
     openarm_->clear_bus_status();
+    std::array<uint64_t, NUM_JOINTS> prev_responses{};
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
+    }
+
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     openarm_->disable_all();
     if (openarm_->get_bus_status().writes_ok != prev_writes + NUM_JOINTS) {
@@ -446,7 +530,8 @@ void Arm::clearFault() {
         throw std::runtime_error(state_.fault_reason);
     }
 
-    openarm_->recv_all(config_.recv_timeout_us);
+    int handshake_timeout_ms = std::max(20, static_cast<int>(config_.recv_timeout_us / 1000) * 10);
+    pollUntilAllJointsRespond(prev_responses, handshake_timeout_ms);
     syncStateFromOpenArm();
 
     if (!state_.bus_healthy) {
@@ -461,7 +546,7 @@ void Arm::clearFault() {
                        " (code=" + std::to_string(js.error_code) + ")");
             throw std::runtime_error(state_.fault_reason);
         }
-        if (!js.online || js.stale) {
+        if (js.responses <= prev_responses[i] || !js.online || js.stale) {
             enterFault("Arm::clearFault: joint " + config_.joints[i].name +
                        " is offline or feedback is stale");
             throw std::runtime_error(state_.fault_reason);
@@ -471,6 +556,8 @@ void Arm::clearFault() {
                        " failed to confirm disabled state");
             throw std::runtime_error(state_.fault_reason);
         }
+        responses_at_last_cmd_[i] = js.responses;
+        last_unanswered_cmd_time_[i] = std::chrono::steady_clock::time_point{};
     }
 
     status_ = ArmStatus::DISARMED;
@@ -482,6 +569,15 @@ ArmState Arm::refresh(int timeout_us) {
     if (!openarm_ || status_ == ArmStatus::DISCONNECTED) {
         throw std::logic_error("Arm::refresh: arm is DISCONNECTED");
     }
+    const auto now = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        uint64_t cur_resp = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
+        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
+            responses_at_last_cmd_[i] = cur_resp;
+            last_unanswered_cmd_time_[i] = now;
+        }
+    }
+
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     openarm_->refresh_all();
     if (openarm_->get_bus_status().writes_ok != prev_writes + NUM_JOINTS) {
@@ -574,8 +670,10 @@ void Arm::verifySendSucceeded(const char* api_name,
                               const std::array<uint32_t, NUM_JOINTS>& prev_rejected) {
     // 检查是否有指令被 OpenArm 内部因模式不匹配而拒绝
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        uint32_t cur_rej = openarm_->get_arm().get_link_stats(resolveDeviceIndex(i)).rejected_commands;
-        if (cur_rej > prev_rejected[i]) {
+        const auto& link = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]);
+        state_.joints[i].commands_sent = link.commands_sent;
+        state_.joints[i].rejected_commands = link.rejected_commands;
+        if (link.rejected_commands > prev_rejected[i]) {
             enterFault(std::string(api_name) + ": command rejected by device on " + config_.joints[i].name);
             syncStateFromOpenArm();
             throw std::runtime_error(state_.fault_reason);
@@ -594,6 +692,8 @@ void Arm::verifySendSucceeded(const char* api_name,
         throw std::runtime_error(state_.fault_reason);
     }
 
+    // 发送后非阻塞排空已到达的反馈帧，避免高频循环中接收队列积压
+    openarm_->recv_all(0);
     syncStateFromOpenArm();
 }
 
@@ -606,6 +706,11 @@ void Arm::sendMIT(std::size_t joint_idx, const MITParam& cmd) {
     }
     if (!validateCommand(joint_idx, cmd)) {
         throw std::invalid_argument("Arm::sendMIT: invalid MIT command on joint " + std::to_string(joint_idx));
+    }
+
+    if (last_unanswered_cmd_time_[joint_idx] == std::chrono::steady_clock::time_point{}) {
+        responses_at_last_cmd_[joint_idx] = state_.joints[joint_idx].responses;
+        last_unanswered_cmd_time_[joint_idx] = std::chrono::steady_clock::now();
     }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
@@ -625,6 +730,14 @@ void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds) {
     }
     if (!validateCommand(cmds)) {
         throw std::invalid_argument("Arm::sendMITAll: invalid MIT commands");
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
+            responses_at_last_cmd_[i] = state_.joints[i].responses;
+            last_unanswered_cmd_time_[i] = now;
+        }
     }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
@@ -648,6 +761,11 @@ void Arm::sendPosVel(std::size_t joint_idx, const PosVelParam& cmd) {
         throw std::invalid_argument("Arm::sendPosVel: invalid PosVel command on joint " + std::to_string(joint_idx));
     }
 
+    if (last_unanswered_cmd_time_[joint_idx] == std::chrono::steady_clock::time_point{}) {
+        responses_at_last_cmd_[joint_idx] = state_.joints[joint_idx].responses;
+        last_unanswered_cmd_time_[joint_idx] = std::chrono::steady_clock::now();
+    }
+
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
@@ -665,6 +783,14 @@ void Arm::sendPosVelAll(const std::array<PosVelParam, NUM_JOINTS>& cmds) {
     }
     if (!validateCommand(cmds)) {
         throw std::invalid_argument("Arm::sendPosVelAll: invalid PosVel commands");
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
+            responses_at_last_cmd_[i] = state_.joints[i].responses;
+            last_unanswered_cmd_time_[i] = now;
+        }
     }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
@@ -688,6 +814,11 @@ void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
         throw std::invalid_argument("Arm::sendVel: invalid Vel command on joint " + std::to_string(joint_idx));
     }
 
+    if (last_unanswered_cmd_time_[joint_idx] == std::chrono::steady_clock::time_point{}) {
+        responses_at_last_cmd_[joint_idx] = state_.joints[joint_idx].responses;
+        last_unanswered_cmd_time_[joint_idx] = std::chrono::steady_clock::now();
+    }
+
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
@@ -705,6 +836,14 @@ void Arm::sendVelAll(const std::array<VelParam, NUM_JOINTS>& cmds) {
     }
     if (!validateCommand(cmds)) {
         throw std::invalid_argument("Arm::sendVelAll: invalid Vel commands");
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        if (last_unanswered_cmd_time_[i] == std::chrono::steady_clock::time_point{}) {
+            responses_at_last_cmd_[i] = state_.joints[i].responses;
+            last_unanswered_cmd_time_[i] = now;
+        }
     }
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;

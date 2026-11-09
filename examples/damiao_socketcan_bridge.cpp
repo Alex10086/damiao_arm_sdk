@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, sigHandler);
     std::signal(SIGTERM, sigHandler);
 
-    BridgeConfig cfg; // cfg.read_only defaults to true
+    BridgeConfig cfg; // cfg.read_only defaults to false (transparent forwarding)
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--socketcan" && i + 1 < argc) {
@@ -45,8 +45,8 @@ int main(int argc, char** argv) {
     std::cout << "SocketCAN Interface: " << cfg.socketcan_if << std::endl;
     std::cout << "USB-CAN Serial Port: " << cfg.serial_port << " @" << cfg.baudrate << std::endl;
     std::cout << "Safety Mode        : "
-              << (cfg.read_only ? "READ-ONLY (default, blocks motion/enable/write_param)"
-                                : "WRITABLE (--allow-motion authorized)")
+              << (cfg.read_only ? "READ-ONLY (--read-only enabled, blocks motion/enable/write_param)"
+                                : "WRITABLE (default transparent forwarding)")
               << std::endl;
     std::cout << "Auto Reconnect     : " << (cfg.auto_reconnect ? "enabled" : "disabled") << std::endl;
 

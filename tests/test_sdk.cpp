@@ -131,10 +131,10 @@ void testUsbTransportValidationAndReassembly() {
 }
 
 void testReadOnlyCommandFilterRules() {
-    std::cout << "[TEST] P0 Read-Only Command Filter Rules (Default read_only=true, Allow 0xCC/0x33 only)..." << std::endl;
+    std::cout << "[TEST] Bridge Default Transparent Mode & Optional Read-Only Command Filter Rules..." << std::endl;
 
     BridgeConfig default_cfg;
-    EXPECT_TRUE(default_cfg.read_only == true, "BridgeConfig::read_only defaults to true");
+    EXPECT_TRUE(default_cfg.read_only == false, "BridgeConfig::read_only defaults to false (transparent)");
 
     CanFrame refresh_frame;
     refresh_frame.can_id = 0x7FF;
@@ -179,7 +179,7 @@ void testReadOnlyCommandFilterRules() {
 }
 
 void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
-    std::cout << "[TEST] End-to-End Bridge + Default Read-Only Protection + Explicit Motion Authorization..." << std::endl;
+    std::cout << "[TEST] End-to-End Bridge + Transparent Forwarding + Opt-in Read-Only Filter..." << std::endl;
 
     int master_fd = -1;
     int slave_fd = -1;
@@ -195,13 +195,12 @@ void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
     bcfg.socketcan_if = "vcan0";
     bcfg.serial_port = slave_name;
     bcfg.auto_reconnect = false;
-    // Notice we do NOT set bcfg.read_only: it defaults to true!
     SocketCanUsbBridge bridge(bcfg);
-    EXPECT_TRUE(bridge.isReadOnly(), "SocketCanUsbBridge defaults to read-only mode");
+    EXPECT_TRUE(!bridge.isReadOnly(), "SocketCanUsbBridge defaults to transparent writable mode");
     bridge.start();
-    EXPECT_TRUE(bridge.isRunning(), "SocketCanUsbBridge started in default read-only mode");
+    EXPECT_TRUE(bridge.isRunning(), "SocketCanUsbBridge started");
 
-    // 1. P0 Check: Initialize OpenArm("vcan0", false) WITHOUT control_modes and verify ZERO bytes sent to USB!
+    // 1. Initialize OpenArm("vcan0", false) WITHOUT control_modes and verify ZERO bytes sent to USB!
     openarm::can::socket::OpenArm openarm("vcan0", false);
     openarm.init_arm_motors({openarm::damiao_motor::MotorType::DM4310}, {0x01}, {0x11});
     openarm.set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
@@ -211,9 +210,18 @@ void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
     uint8_t tx_buf[128]{};
     ssize_t init_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
     EXPECT_TRUE(init_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
-                "P0 Verified: OpenArm init_arm_motors without control_modes emits ZERO bus writes");
+                "OpenArm init_arm_motors without control_modes emits ZERO bus writes");
 
-    // 2. P0 Check: Attempt to call openarm.enable_all() and mit_control_one() while Bridge is in default read_only mode
+    // 2. Default transparent mode forwards enable_all() directly without hidden blocking
+    openarm.enable_all();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    ssize_t enable_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
+    EXPECT_TRUE(enable_bytes == 30 && tx_buf[28] == 0xFC,
+                "Default Bridge forwarded enable frame (0xFC)");
+
+    // 3. Opt-in to read-only mode (setReadOnly(true)) and verify motion/enable commands are blocked
+    bridge.setReadOnly(true);
+    EXPECT_TRUE(bridge.isReadOnly(), "Bridge read-only filter enabled");
     openarm.enable_all();
     openarm.get_arm().mit_control_one(0, {0.5, 0.0, 10.0, 0.5, 0.0});
     openarm.get_arm().set_control_mode_all(openarm::damiao_motor::ControlMode::MIT);
@@ -221,26 +229,17 @@ void testBridgeEndToEndWithOpenArmAndReadOnlyProtection() {
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     ssize_t blocked_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
     EXPECT_TRUE(blocked_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
-                "P0 Verified: Default Read-Only Bridge blocked enable_all, mit_control_one, and set_control_mode_all");
+                "Read-Only Bridge blocked enable_all, mit_control_one, and set_control_mode_all");
     auto st_after_block = bridge.getStats();
-    EXPECT_TRUE(st_after_block.sock_readonly_blocked == 3 && st_after_block.sock_to_usb_forwarded == 0,
-                "BridgeStats recorded 3 blocked unsafe commands and 0 forwarded");
+    EXPECT_TRUE(st_after_block.sock_readonly_blocked == 3 && st_after_block.sock_to_usb_forwarded == 1,
+                "BridgeStats recorded 3 blocked unsafe commands and 1 forwarded");
 
-    // 3. Send a safe passive status refresh from OpenArm and verify it IS forwarded to USB
+    // 4. Send a safe passive status refresh from OpenArm while in read-only mode and verify it IS forwarded
     openarm.refresh_one(0);
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     ssize_t refresh_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
     EXPECT_TRUE(refresh_bytes == 30 && tx_buf[0] == 0x55 && tx_buf[1] == 0xAA,
-                "Default Read-Only Bridge allowed passive refresh_one(0) (30-byte USB packet)");
-
-    // 4. Explicitly authorize motion forwarding (setReadOnly(false)) and verify enable_all() is now forwarded
-    bridge.setReadOnly(false);
-    EXPECT_TRUE(!bridge.isReadOnly(), "Bridge motion forwarding explicitly authorized");
-    openarm.enable_all();
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    ssize_t enable_bytes = ::read(master_fd, tx_buf, sizeof(tx_buf));
-    EXPECT_TRUE(enable_bytes == 30 && tx_buf[28] == 0xFC,
-                "Authorized Bridge forwarded enable frame (0xFC)");
+                "Read-Only Bridge allowed passive refresh_one(0) (30-byte USB packet)");
 
     // 5. Inject simulated J4310 feedback from USB -> vcan0 -> OpenArm, and verify no loopback echo
     auto usb_fb = buildUsbRxPacket(0x11, 0x11, 8, false, false, {0x01, 0x80, 0x00, 0x80, 0x08, 0x00, 26, 25});

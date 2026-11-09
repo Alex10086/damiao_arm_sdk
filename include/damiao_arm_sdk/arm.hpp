@@ -15,7 +15,7 @@ namespace damiao {
 class Arm {
 public:
     explicit Arm(const ArmConfig& config = ArmConfig::defaultJ4310SixAxis());
-    ~Arm() = default;
+    ~Arm() noexcept;
 
     Arm(const Arm&) = delete;
     Arm& operator=(const Arm&) = delete;
@@ -25,13 +25,13 @@ public:
     bool isConnected() const noexcept { return status_ != ArmStatus::DISCONNECTED; }
 
     // 2. 安全状态转换：DISARMED <-> ARMED / FAULT
-    void enable();     // 严格检查六电机在线、新鲜、无故障并确认全部使能成功后进入 ARMED
+    void enable();     // 检查六电机在线、新鲜、无故障并轮询确认全部使能成功后进入 ARMED
     void disable();    // 失能六台电机，回到 DISARMED 状态
     void clearFault(); // 严格恢复：仅在总线健康且无电机故障/超时时退出 FAULT 回到 DISARMED
 
     // 3. 状态刷新与读取（只读安全）
     ArmState refresh(int timeout_us = -1);  // 发送 0xCC 刷新并接收更新所有关节状态
-    void recv(int timeout_us = -1);         // 仅接收并更新状态（适用于控制指令发送后）
+    void recv(int timeout_us = -1);         // 接收并更新状态
     ArmState getState() const noexcept { return state_; }
     ArmStatus status() const noexcept { return status_; }
     const ArmConfig& config() const noexcept { return config_; }
@@ -61,6 +61,8 @@ public:
 
 private:
     void syncStateFromOpenArm();
+    bool pollUntilAllJointsRespond(const std::array<uint64_t, NUM_JOINTS>& baseline_responses,
+                                   int total_timeout_ms);
     int resolveDeviceIndex(std::size_t joint_idx) const;
     void verifySendSucceeded(const char* api_name,
                              uint64_t prev_writes_ok,
@@ -71,6 +73,8 @@ private:
     ArmStatus status_{ArmStatus::DISCONNECTED};
     ArmState state_{};
     std::array<int, NUM_JOINTS> joint_to_dev_idx_{0, 1, 2, 3, 4, 5};
+    std::array<uint64_t, NUM_JOINTS> responses_at_last_cmd_{0, 0, 0, 0, 0, 0};
+    std::array<std::chrono::steady_clock::time_point, NUM_JOINTS> last_unanswered_cmd_time_{};
     std::unique_ptr<openarm::can::socket::OpenArm> openarm_;
 };
 
