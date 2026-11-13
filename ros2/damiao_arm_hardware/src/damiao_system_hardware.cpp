@@ -227,13 +227,6 @@ hardware_interface::CallbackReturn DamiaoSystemHardware::on_configure(
         arm_ = std::make_unique<damiao::Arm>(arm_config_);
         arm_->init();
 
-        if (!arm_->refreshUntilAllFresh(100)) {
-            RCLCPP_ERROR(logger(), "on_configure: failed to receive fresh feedback from all %zu motors",
-                         joint_names_.size());
-            teardownHardware();
-            return CallbackReturn::ERROR;
-        }
-
         if (arm_config_.motor_timeout_reg > 0) {
             if (!arm_->configureMotorTimeout(arm_config_.motor_timeout_reg, 100)) {
                 RCLCPP_ERROR(logger(),
@@ -255,6 +248,14 @@ hardware_interface::CallbackReturn DamiaoSystemHardware::on_configure(
                                 arm_config_.command_timeout_ms);
                 }
             }
+        }
+
+        // Refresh all state frames AFTER parameter transactions so initial buffers are clean
+        if (!arm_->refreshUntilAllFresh(100)) {
+            RCLCPP_ERROR(logger(), "on_configure: failed to receive fresh feedback from all %zu motors",
+                         joint_names_.size());
+            teardownHardware();
+            return CallbackReturn::ERROR;
         }
 
         copyArmStateToBuffers(arm_->getState());
@@ -518,11 +519,31 @@ void DamiaoSystemHardware::latchAllCommandsToCurrentState() {
 }
 
 damiao::MITParam DamiaoSystemHardware::buildMitCommand(std::size_t idx, const damiao::JointConfig& jc) {
+    static rclcpp::Clock warn_clock(RCL_STEADY_TIME);
+    auto clampCmd = [&](const char* field, double raw, double lo, double hi, double fallback) -> double {
+        if (!std::isfinite(raw)) {
+            RCLCPP_WARN_THROTTLE(logger(), warn_clock, 1000,
+                                 "Non-finite %s command on '%s', using fallback %.4f",
+                                 field, joint_names_[idx].c_str(), fallback);
+            return std::clamp(fallback, lo, hi);
+        }
+        if (raw < lo || raw > hi) {
+            double clamped = std::clamp(raw, lo, hi);
+            RCLCPP_WARN_THROTTLE(logger(), warn_clock, 1000,
+                                 "Command %s=%.4f out of bounds [%.4f, %.4f] on '%s', clamping to %.4f",
+                                 field, raw, lo, hi, joint_names_[idx].c_str(), clamped);
+            return clamped;
+        }
+        return raw;
+    };
+
     double safe_pos = std::isfinite(pos_states_[idx]) ? pos_states_[idx] : pos_latched_[idx];
     safe_pos = std::clamp(safe_pos, jc.pos_min, jc.pos_max);
 
     const uint8_t mask = claimed_mask_[idx];
-    if ((mask & CLAIM_POS) == 0) {
+    // Only track measured position when actively controlled in a non-position mode (VEL/EFF);
+    // in HOLD (CLAIM_NONE), keep pos_latched_ frozen so proportional stiffness holds against gravity!
+    if (mask != CLAIM_NONE && (mask & CLAIM_POS) == 0) {
         pos_latched_[idx] = safe_pos;
     }
 
@@ -530,25 +551,25 @@ damiao::MITParam DamiaoSystemHardware::buildMitCommand(std::size_t idx, const da
     if (mask == CLAIM_NONE) {
         cmd.kp = default_kp_[idx];
         cmd.kd = default_kd_[idx];
-        cmd.q = pos_latched_[idx];
+        cmd.q = std::clamp(pos_latched_[idx], jc.pos_min, jc.pos_max);
         cmd.dq = 0.0;
         cmd.tau = 0.0;
         return cmd;
     }
 
     if ((mask & CLAIM_KP) || (mask & CLAIM_KD)) {
-        cmd.q = ((mask & CLAIM_POS) && std::isfinite(pos_commands_[idx])) ? pos_commands_[idx] : safe_pos;
-        cmd.dq = ((mask & CLAIM_VEL) && std::isfinite(vel_commands_[idx])) ? vel_commands_[idx] : 0.0;
-        cmd.tau = ((mask & CLAIM_EFF) && std::isfinite(tau_commands_[idx])) ? tau_commands_[idx] : 0.0;
-        cmd.kp = ((mask & CLAIM_KP) && std::isfinite(kp_commands_[idx])) ? kp_commands_[idx] : default_kp_[idx];
-        cmd.kd = ((mask & CLAIM_KD) && std::isfinite(kd_commands_[idx])) ? kd_commands_[idx] : default_kd_[idx];
+        cmd.q = (mask & CLAIM_POS) ? clampCmd("position", pos_commands_[idx], jc.pos_min, jc.pos_max, safe_pos) : safe_pos;
+        cmd.dq = (mask & CLAIM_VEL) ? clampCmd("velocity", vel_commands_[idx], -jc.vel_max, jc.vel_max, 0.0) : 0.0;
+        cmd.tau = (mask & CLAIM_EFF) ? clampCmd("effort", tau_commands_[idx], -jc.tau_max, jc.tau_max, 0.0) : 0.0;
+        cmd.kp = (mask & CLAIM_KP) ? clampCmd("kp", kp_commands_[idx], 0.0, jc.kp_max, default_kp_[idx]) : default_kp_[idx];
+        cmd.kd = (mask & CLAIM_KD) ? clampCmd("kd", kd_commands_[idx], 0.0, jc.kd_max, default_kd_[idx]) : default_kd_[idx];
         return cmd;
     }
 
     if (mask & CLAIM_POS) {
-        cmd.q = std::isfinite(pos_commands_[idx]) ? pos_commands_[idx] : pos_latched_[idx];
-        cmd.dq = ((mask & CLAIM_VEL) && std::isfinite(vel_commands_[idx])) ? vel_commands_[idx] : 0.0;
-        cmd.tau = ((mask & CLAIM_EFF) && std::isfinite(tau_commands_[idx])) ? tau_commands_[idx] : 0.0;
+        cmd.q = clampCmd("position", pos_commands_[idx], jc.pos_min, jc.pos_max, pos_latched_[idx]);
+        cmd.dq = (mask & CLAIM_VEL) ? clampCmd("velocity", vel_commands_[idx], -jc.vel_max, jc.vel_max, 0.0) : 0.0;
+        cmd.tau = (mask & CLAIM_EFF) ? clampCmd("effort", tau_commands_[idx], -jc.tau_max, jc.tau_max, 0.0) : 0.0;
         cmd.kp = default_kp_[idx];
         cmd.kd = default_kd_[idx];
         return cmd;
@@ -558,7 +579,7 @@ damiao::MITParam DamiaoSystemHardware::buildMitCommand(std::size_t idx, const da
         cmd.kp = 0.0;
         cmd.kd = default_kd_[idx];
         cmd.q = safe_pos;
-        cmd.dq = std::isfinite(vel_commands_[idx]) ? vel_commands_[idx] : 0.0;
+        cmd.dq = clampCmd("velocity", vel_commands_[idx], -jc.vel_max, jc.vel_max, 0.0);
         cmd.tau = 0.0;
         return cmd;
     }
@@ -568,7 +589,7 @@ damiao::MITParam DamiaoSystemHardware::buildMitCommand(std::size_t idx, const da
     cmd.kd = 0.0;
     cmd.q = safe_pos;
     cmd.dq = 0.0;
-    cmd.tau = std::isfinite(tau_commands_[idx]) ? tau_commands_[idx] : 0.0;
+    cmd.tau = clampCmd("effort", tau_commands_[idx], -jc.tau_max, jc.tau_max, 0.0);
     return cmd;
 }
 

@@ -333,6 +333,7 @@ void testGripperAndCommandWatchdog() {
     drainSocket(fd);
 
     std::atomic<bool> running{true};
+    std::atomic<bool> spoof_readback_with_0x55{false};
     std::atomic<unsigned> queries{0}, motions{0}, disables{0};
     std::thread simulator([&] {
         std::array<bool, NUM_JOINTS + 1> enabled{};
@@ -360,7 +361,7 @@ void testGripperAndCommandWatchdog() {
                     reply.can_dlc = 8;
                     reply.data[0] = request.data[0];
                     reply.data[1] = request.data[1];
-                    reply.data[2] = request.data[2];
+                    reply.data[2] = (spoof_readback_with_0x55.load() && request.data[2] == 0x33) ? 0x55 : request.data[2];
                     reply.data[3] = request.data[3];
                     reply.data[4] = static_cast<uint8_t>(cur & 0xFF);
                     reply.data[5] = static_cast<uint8_t>((cur >> 8) & 0xFF);
@@ -405,6 +406,9 @@ void testGripperAndCommandWatchdog() {
 
         Arm arm(cfg);
         arm.init();
+        spoof_readback_with_0x55 = true;
+        EXPECT_TRUE(!arm.configureMotorTimeout(2000, 30), "configureMotorTimeout rejects 0x55 packet masquerading as 0x33 readback");
+        spoof_readback_with_0x55 = false;
         EXPECT_TRUE(arm.configureMotorTimeout(2000, 100), "RID::TIMEOUT (2000) written and verified across all 7 motors");
         auto rb = arm.queryMotorTimeouts(100);
         EXPECT_TRUE(rb.size() == 7 && rb[0].has_value() && *rb[0] == 2000 && rb[6].has_value() && *rb[6] == 2000,

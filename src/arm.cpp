@@ -99,13 +99,131 @@ void validateJointConfig(const JointConfig& j,
 
 struct StateCallbackGuard {
     openarm::can::socket::OpenArm& arm;
+    openarm::canbus::CANSocket& sock;
+    bool enable_fd;
     ~StateCallbackGuard() {
         try {
+            int count = 0;
+            while (count++ < 64 && sock.is_data_available(0)) {
+                if (enable_fd) {
+                    canfd_frame f{};
+                    if (!sock.read_canfd_frame(f)) break;
+                    if (f.can_id & CAN_ERR_FLAG) sock.get_bus_status().record_error_frame(f.can_id, f.data, f.len);
+                } else {
+                    can_frame f{};
+                    if (!sock.read_can_frame(f)) break;
+                    if (f.can_id & CAN_ERR_FLAG) sock.get_bus_status().record_error_frame(f.can_id, f.data, f.can_dlc);
+                }
+            }
             arm.set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
         } catch (...) {
         }
     }
 };
+
+void boundedDrainSocket(openarm::canbus::CANSocket& sock, bool enable_fd, int max_frames = 64) {
+    int count = 0;
+    while (count++ < max_frames && sock.is_data_available(0)) {
+        if (enable_fd) {
+            canfd_frame f{};
+            if (!sock.read_canfd_frame(f)) break;
+            if (f.can_id & CAN_ERR_FLAG) {
+                sock.get_bus_status().record_error_frame(f.can_id, f.data, f.len);
+            }
+        } else {
+            can_frame f{};
+            if (!sock.read_can_frame(f)) break;
+            if (f.can_id & CAN_ERR_FLAG) {
+                sock.get_bus_status().record_error_frame(f.can_id, f.data, f.can_dlc);
+            }
+        }
+    }
+}
+
+std::optional<uint32_t> transactTimeoutRegister(openarm::canbus::CANSocket& sock,
+                                                bool enable_fd,
+                                                uint32_t send_can_id,
+                                                uint32_t recv_can_id,
+                                                uint8_t cmd,
+                                                uint32_t write_val,
+                                                int timeout_ms) {
+    constexpr uint8_t kTimeoutRid = static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT);
+    bool sent = false;
+    if (enable_fd) {
+        canfd_frame f{};
+        f.can_id = 0x7FF;
+        f.len = 8;
+        f.flags = CANFD_BRS;
+        f.data[0] = static_cast<uint8_t>(send_can_id & 0xFF);
+        f.data[1] = static_cast<uint8_t>((send_can_id >> 8) & 0xFF);
+        f.data[2] = cmd;
+        f.data[3] = kTimeoutRid;
+        f.data[4] = static_cast<uint8_t>(write_val & 0xFF);
+        f.data[5] = static_cast<uint8_t>((write_val >> 8) & 0xFF);
+        f.data[6] = static_cast<uint8_t>((write_val >> 16) & 0xFF);
+        f.data[7] = static_cast<uint8_t>((write_val >> 24) & 0xFF);
+        sent = sock.write_canfd_frame(f);
+    } else {
+        can_frame f{};
+        f.can_id = 0x7FF;
+        f.can_dlc = 8;
+        f.data[0] = static_cast<uint8_t>(send_can_id & 0xFF);
+        f.data[1] = static_cast<uint8_t>((send_can_id >> 8) & 0xFF);
+        f.data[2] = cmd;
+        f.data[3] = kTimeoutRid;
+        f.data[4] = static_cast<uint8_t>(write_val & 0xFF);
+        f.data[5] = static_cast<uint8_t>((write_val >> 8) & 0xFF);
+        f.data[6] = static_cast<uint8_t>((write_val >> 16) & 0xFF);
+        f.data[7] = static_cast<uint8_t>((write_val >> 24) & 0xFF);
+        sent = sock.write_can_frame(f);
+    }
+    if (!sent) {
+        return std::nullopt;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        const auto remaining_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining_us <= 0 || !sock.is_data_available(static_cast<int>(remaining_us))) {
+            return std::nullopt;
+        }
+        canid_t rx_id = 0;
+        uint8_t rx_len = 0;
+        std::array<uint8_t, 8> rx_data{};
+        if (enable_fd) {
+            canfd_frame rf{};
+            if (!sock.read_canfd_frame(rf)) continue;
+            if (rf.can_id & CAN_ERR_FLAG) {
+                sock.get_bus_status().record_error_frame(rf.can_id, rf.data, rf.len);
+                continue;
+            }
+            rx_id = rf.can_id & CAN_EFF_MASK;
+            rx_len = rf.len;
+            if (rx_len >= 8) std::memcpy(rx_data.data(), rf.data, 8);
+        } else {
+            can_frame rf{};
+            if (!sock.read_can_frame(rf)) continue;
+            if (rf.can_id & CAN_ERR_FLAG) {
+                sock.get_bus_status().record_error_frame(rf.can_id, rf.data, rf.can_dlc);
+                continue;
+            }
+            rx_id = rf.can_id & CAN_EFF_MASK;
+            rx_len = rf.can_dlc;
+            if (rx_len >= 8) std::memcpy(rx_data.data(), rf.data, 8);
+        }
+        if (rx_len < 8) continue;
+        const uint16_t from_id = static_cast<uint16_t>(rx_data[0]) |
+                                 (static_cast<uint16_t>(rx_data[1]) << 8);
+        if (rx_id == recv_can_id && from_id == send_can_id &&
+            rx_data[2] == cmd && rx_data[3] == kTimeoutRid) {
+            return static_cast<uint32_t>(rx_data[4]) |
+                   (static_cast<uint32_t>(rx_data[5]) << 8) |
+                   (static_cast<uint32_t>(rx_data[6]) << 16) |
+                   (static_cast<uint32_t>(rx_data[7]) << 24);
+        }
+    }
+}
 
 } // namespace
 
@@ -595,7 +713,7 @@ void Arm::enable() {
         }
     }
     if (any_non_mit) {
-        StateCallbackGuard guard{*openarm_};
+        StateCallbackGuard guard{*openarm_, openarm_->get_master_can_device_collection().get_can_socket(), config_.enable_fd};
         openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::PARAM);
         auto syncModeOne = [&](int dev_idx, const JointConfig& jc) {
             if (jc.control_mode != ControlMode::MIT) {
@@ -818,43 +936,24 @@ std::vector<std::optional<uint32_t>> Arm::queryMotorTimeouts(int timeout_ms) {
         throw std::logic_error("Arm::queryMotorTimeouts: arm must be DISARMED");
     }
 
-    constexpr int kTimeoutRid = static_cast<int>(openarm::damiao_motor::RID::TIMEOUT);
-    StateCallbackGuard guard{*openarm_};
-    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::PARAM);
-    openarm_->recv_all(0);
+    auto& can_sock = openarm_->get_master_can_device_collection().get_can_socket();
+    StateCallbackGuard guard{*openarm_, can_sock, config_.enable_fd};
+    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::IGNORE);
+    boundedDrainSocket(can_sock, config_.enable_fd);
 
-    std::array<uint64_t, NUM_JOINTS> prev_responses{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
-    }
-    uint64_t prev_gripper_responses =
-        config_.has_gripper ? openarm_->get_arm().get_link_stats(gripper_dev_idx_).responses : 0;
-
-    const uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
-    openarm_->query_param_all(kTimeoutRid);
-    if (openarm_->get_bus_status().writes_ok != prev_writes + config_.activeMotorCount()) {
-        throw std::runtime_error("Arm::queryMotorTimeouts: CAN write failed");
-    }
-
-    pollUntilAllRespond(prev_responses, prev_gripper_responses, timeout_ms, false, false);
-
+    const int per_motor_ms = std::max(15, timeout_ms);
     std::vector<std::optional<uint32_t>> results(config_.activeMotorCount(), std::nullopt);
-    auto extractVal = [&](int dev_idx, uint64_t baseline) -> std::optional<uint32_t> {
-        if (openarm_->get_arm().get_link_stats(dev_idx).responses <= baseline) {
-            return std::nullopt;
-        }
-        double v = openarm_->get_arm().get_motor(dev_idx).get_param(kTimeoutRid);
-        if (!std::isfinite(v) || v < 0.0) {
-            return std::nullopt;
-        }
-        return static_cast<uint32_t>(std::llround(v));
-    };
-
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        results[i] = extractVal(joint_to_dev_idx_[i], prev_responses[i]);
+        results[i] = transactTimeoutRegister(
+            can_sock, config_.enable_fd,
+            config_.joints[i].send_can_id, config_.joints[i].recv_can_id,
+            0x33, 0, per_motor_ms);
     }
     if (config_.has_gripper) {
-        results[NUM_JOINTS] = extractVal(gripper_dev_idx_, prev_gripper_responses);
+        results[NUM_JOINTS] = transactTimeoutRegister(
+            can_sock, config_.enable_fd,
+            config_.gripper.send_can_id, config_.gripper.recv_can_id,
+            0x33, 0, per_motor_ms);
     }
     return results;
 }
@@ -865,70 +964,32 @@ bool Arm::configureMotorTimeout(uint32_t raw_timeout_reg, int timeout_ms) {
         throw std::logic_error("Arm::configureMotorTimeout: arm must be DISARMED");
     }
 
-    constexpr uint8_t kTimeoutRid = static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT);
-    StateCallbackGuard guard{*openarm_};
-    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::PARAM);
-    openarm_->recv_all(0);
-
-    std::array<uint64_t, NUM_JOINTS> prev_responses{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
-    }
-    uint64_t prev_gripper_responses =
-        config_.has_gripper ? openarm_->get_arm().get_link_stats(gripper_dev_idx_).responses : 0;
-
     auto& can_sock = openarm_->get_master_can_device_collection().get_can_socket();
-    auto writeTimeoutFrame = [&](uint32_t send_can_id) -> bool {
-        if (config_.enable_fd) {
-            canfd_frame f{};
-            f.can_id = 0x7FF;
-            f.len = 8;
-            f.flags = CANFD_BRS;
-            f.data[0] = static_cast<uint8_t>(send_can_id & 0xFF);
-            f.data[1] = static_cast<uint8_t>((send_can_id >> 8) & 0xFF);
-            f.data[2] = 0x55;
-            f.data[3] = kTimeoutRid;
-            f.data[4] = static_cast<uint8_t>(raw_timeout_reg & 0xFF);
-            f.data[5] = static_cast<uint8_t>((raw_timeout_reg >> 8) & 0xFF);
-            f.data[6] = static_cast<uint8_t>((raw_timeout_reg >> 16) & 0xFF);
-            f.data[7] = static_cast<uint8_t>((raw_timeout_reg >> 24) & 0xFF);
-            return can_sock.write_canfd_frame(f);
-        } else {
-            can_frame f{};
-            f.can_id = 0x7FF;
-            f.can_dlc = 8;
-            f.data[0] = static_cast<uint8_t>(send_can_id & 0xFF);
-            f.data[1] = static_cast<uint8_t>((send_can_id >> 8) & 0xFF);
-            f.data[2] = 0x55;
-            f.data[3] = kTimeoutRid;
-            f.data[4] = static_cast<uint8_t>(raw_timeout_reg & 0xFF);
-            f.data[5] = static_cast<uint8_t>((raw_timeout_reg >> 8) & 0xFF);
-            f.data[6] = static_cast<uint8_t>((raw_timeout_reg >> 16) & 0xFF);
-            f.data[7] = static_cast<uint8_t>((raw_timeout_reg >> 24) & 0xFF);
-            return can_sock.write_can_frame(f);
+    StateCallbackGuard guard{*openarm_, can_sock, config_.enable_fd};
+    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::IGNORE);
+    boundedDrainSocket(can_sock, config_.enable_fd);
+
+    const int per_motor_ms = std::max(15, timeout_ms);
+    auto writeAndVerifyOne = [&](const JointConfig& jc) -> bool {
+        auto ack = transactTimeoutRegister(
+            can_sock, config_.enable_fd, jc.send_can_id, jc.recv_can_id,
+            0x55, raw_timeout_reg, per_motor_ms);
+        if (!ack.has_value()) {
+            return false;
         }
+        auto readback = transactTimeoutRegister(
+            can_sock, config_.enable_fd, jc.send_can_id, jc.recv_can_id,
+            0x33, 0, per_motor_ms);
+        return readback.has_value() && *readback == raw_timeout_reg;
     };
 
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        if (!writeTimeoutFrame(config_.joints[i].send_can_id)) {
+        if (!writeAndVerifyOne(config_.joints[i])) {
             return false;
         }
     }
-    if (config_.has_gripper && !writeTimeoutFrame(config_.gripper.send_can_id)) {
+    if (config_.has_gripper && !writeAndVerifyOne(config_.gripper)) {
         return false;
-    }
-
-    pollUntilAllRespond(prev_responses, prev_gripper_responses, timeout_ms, false, false);
-
-    // 显式回读 RID::TIMEOUT 验证所有电机均已生效
-    const auto readbacks = queryMotorTimeouts(timeout_ms);
-    if (readbacks.size() != config_.activeMotorCount()) {
-        return false;
-    }
-    for (const auto& rb : readbacks) {
-        if (!rb.has_value() || *rb != raw_timeout_reg) {
-            return false;
-        }
     }
     return true;
 }
