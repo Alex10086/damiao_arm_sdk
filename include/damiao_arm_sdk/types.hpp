@@ -56,13 +56,35 @@ struct JointConfig {
     double kd_max{5.0};
 };
 
-// 六轴机械臂统一配置：定义六台电机型号、ID、控制模式及关节顺序
+// 六轴机械臂（+可选夹爪）统一配置
 struct ArmConfig {
     std::string can_interface{"vcan0"};
     bool enable_fd{false};
-    uint32_t state_timeout_ms{500}; // 通信超时阈值 (ms)
-    int recv_timeout_us{1000};      // 单次 recv_all 首包等待时间 (us)
+    uint32_t state_timeout_ms{500};   // 反馈新鲜度超时阈值 (ms)
+    uint32_t command_timeout_ms{0};   // 周期控制看门狗超时 (ms): 0=空闲保活(0xCC), >0=控制停发超时即FAULT
+    uint32_t motor_timeout_reg{0};    // 电机端 RID::TIMEOUT (RID 9) 原始 uint32 值: 0=不写入(仅诊断读取), >0=配置阶段写入RAM并回读校验
+    int recv_timeout_us{1000};        // 单次 recv_all 首包等待时间 (us)
     std::array<JointConfig, NUM_JOINTS> joints{};
+
+    // 可选第 7 轴夹爪电机配置（默认关闭，开启后与 6 轴统一管理）
+    bool has_gripper{false};
+    JointConfig gripper{
+        "gripper_joint",
+        MotorType::DM4310,
+        0x07,
+        0x17,
+        ControlMode::MIT,
+        -12.5,
+        12.5,
+        30.0,
+        10.0,
+        500.0,
+        5.0
+    };
+
+    std::size_t activeMotorCount() const noexcept {
+        return has_gripper ? (NUM_JOINTS + 1) : NUM_JOINTS;
+    }
 
     // 默认 6 轴 J4310 配置（关节 0~5 对应 CAN ID 0x01~0x06，反馈 ID 0x11~0x16）
     static ArmConfig defaultJ4310SixAxis(const std::string& can_if = "vcan0");
@@ -98,10 +120,12 @@ struct JointState {
     bool stale{true};
 };
 
-// 六轴机械臂统一状态：返回六台电机的反馈、故障和通信状态
+// 六轴机械臂（+可选夹爪）统一状态
 struct ArmState {
     ArmStatus status{ArmStatus::DISCONNECTED};
     std::array<JointState, NUM_JOINTS> joints{};
+    bool has_gripper{false};
+    JointState gripper{};
     bool bus_healthy{true};
     bool all_online{false};
     bool any_fault{false};

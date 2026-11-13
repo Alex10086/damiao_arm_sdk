@@ -1,0 +1,124 @@
+controller_manager:
+  ros__parameters:
+    # 200 Hz leaves ample margin on 921600-baud Damiao USB-CAN for 7 motors (30B TX + 16B RX each)
+    update_rate: 200
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    forward_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    forward_velocity_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    forward_effort_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    gripper_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    # Optional per-joint atomic 5-channel MIT controllers (q, dq, tau, kp, kd in one Float64MultiArray)
+    joint1_mit_controller:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+    joint2_mit_controller:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+    joint3_mit_controller:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+    joint4_mit_controller:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+    joint5_mit_controller:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+    joint6_mit_controller:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+
+joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    set_last_command_interface_value_as_state_on_activation: true
+
+forward_position_controller:
+  ros__parameters:
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+    interface_name: position
+
+forward_velocity_controller:
+  ros__parameters:
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+    interface_name: velocity
+
+forward_effort_controller:
+  ros__parameters:
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+    interface_name: effort
+
+gripper_position_controller:
+  ros__parameters:
+    joints:
+      - gripper_joint
+    interface_name: position
+
+joint1_mit_controller:
+  ros__parameters:
+    joint: joint1
+    interface_names: [position, velocity, effort, kp, kd]
+
+joint2_mit_controller:
+  ros__parameters:
+    joint: joint2
+    interface_names: [position, velocity, effort, kp, kd]
+
+joint3_mit_controller:
+  ros__parameters:
+    joint: joint3
+    interface_names: [position, velocity, effort, kp, kd]
+
+joint4_mit_controller:
+  ros__parameters:
+    joint: joint4
+    interface_names: [position, velocity, effort, kp, kd]
+
+joint5_mit_controller:
+  ros__parameters:
+    joint: joint5
+    interface_names: [position, velocity, effort, kp, kd]
+
+joint6_mit_controller:
+  ros__parameters:
+    joint: joint6
+    interface_names: [position, velocity, effort, kp, kd]

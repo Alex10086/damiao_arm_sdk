@@ -1,0 +1,9 @@
+<library path="damiao_arm_hardware">
+  <class name="damiao_arm_hardware/DamiaoSystemHardware"
+         type="damiao_arm_hardware::DamiaoSystemHardware"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      ros2_control SystemInterface plugin for Damiao 6-axis arm (+ optional gripper) via damiao_arm_sdk
+    </description>
+  </class>
+</library>

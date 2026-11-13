@@ -1,8 +1,8 @@
 #include "damiao_arm_sdk/arm.hpp"
 #include "damiao_arm_sdk/types.hpp"
 
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -128,6 +128,11 @@ void testArmConfigAndYaml() {
     dup_cfg.joints[3].send_can_id = 0x01;
     EXPECT_THROW(dup_cfg.validate(), std::invalid_argument, "Duplicate send_can_id rejected");
 
+    ArmConfig grip_dup = def_cfg;
+    grip_dup.has_gripper = true;
+    grip_dup.gripper.send_can_id = 0x06;
+    EXPECT_THROW(grip_dup.validate(), std::invalid_argument, "Duplicate gripper send_can_id rejected");
+
     ArmConfig yaml_cfg = ArmConfig::fromYaml(std::string(DAMIAO_SOURCE_DIR) + "/config/arm.yaml");
     EXPECT_TRUE(yaml_cfg.can_interface == "vcan0" && !yaml_cfg.enable_fd, "YAML loaded can_interface and enable_fd");
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
@@ -188,7 +193,7 @@ void testStrictEnableAndReinitSafety() {
     // 5. Re-initialization while in FAULT is forbidden
     EXPECT_THROW(arm.init(), std::logic_error, "init() forbidden when Arm is in FAULT");
 
-    // 6. Recover from FAULT cleanly, then enable all 6 motors with staggered serial-like replies (1.5ms apart)
+    // 6. Recover from FAULT cleanly, then enable all 6 motors with staggered serial-like replies (2ms apart)
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         sendSimulatedFeedback(sim_fd, 0x11 + i, i + 1, 0x0, 0.0, 0.0, 0.0, 25, 25);
     }
@@ -240,7 +245,6 @@ void testStrictFaultRecoveryAndBatchCommandFailures() {
                 continue;
             }
             if (id < 1 || id > NUM_JOINTS || missing.load() == static_cast<int>(id)) continue;
-            // Build a valid reply without touching assertion counters from the worker.
             can_frame reply{};
             reply.can_id = 0x10 + id;
             reply.can_dlc = 8;
@@ -250,7 +254,6 @@ void testStrictFaultRecoveryAndBatchCommandFailures() {
             reply.data[3] = 0x80;
             reply.data[4] = 0x08;
             reply.data[6] = reply.data[7] = 25;
-            // Stagger replies beyond the old single-receive window.
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             if (::write(fd, &reply, sizeof(reply)) != sizeof(reply)) running = false;
         }
@@ -261,8 +264,7 @@ void testStrictFaultRecoveryAndBatchCommandFailures() {
         Arm arm(cfg);
         arm.init();
         auto bringOnline = [&] {
-            arm.refresh(5000);
-            for (int i = 0; i < 6; ++i) arm.recv(5000);
+            EXPECT_TRUE(arm.refreshUntilAllFresh(50), "refreshUntilAllFresh brings all 6 joints online");
         };
         auto waitStatus = [&](ArmStatus expected) {
             const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -324,12 +326,142 @@ void testStrictFaultRecoveryAndBatchCommandFailures() {
     ::close(fd);
 }
 
+void testGripperAndCommandWatchdog() {
+    std::cout << "[TEST] Optional 7th-axis Gripper + RID::TIMEOUT Config + Command Watchdog..." << std::endl;
+    const int fd = openRawVcanSocket();
+    if (fd < 0) throw std::runtime_error("Cannot open simulator socket");
+    drainSocket(fd);
+
+    std::atomic<bool> running{true};
+    std::atomic<unsigned> queries{0}, motions{0}, disables{0};
+    std::thread simulator([&] {
+        std::array<bool, NUM_JOINTS + 1> enabled{};
+        std::array<uint32_t, NUM_JOINTS + 1> timeout_reg{};
+        while (running.load()) {
+            pollfd pfd{fd, POLLIN, 0};
+            if (::poll(&pfd, 1, 2) <= 0) continue;
+            can_frame request{};
+            if (::read(fd, &request, sizeof(request)) != sizeof(request)) continue;
+            unsigned id = request.can_id;
+            if (id == 0x7FF && (request.data[2] == 0x55 || request.data[2] == 0x33) &&
+                request.data[3] == static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT)) {
+                unsigned target = request.data[0] | (request.data[1] << 8);
+                if (target >= 1 && target <= NUM_JOINTS + 1) {
+                    if (request.data[2] == 0x55) {
+                        uint32_t val = static_cast<uint32_t>(request.data[4]) |
+                                       (static_cast<uint32_t>(request.data[5]) << 8) |
+                                       (static_cast<uint32_t>(request.data[6]) << 16) |
+                                       (static_cast<uint32_t>(request.data[7]) << 24);
+                        timeout_reg[target - 1] = val;
+                    }
+                    uint32_t cur = timeout_reg[target - 1];
+                    can_frame reply{};
+                    reply.can_id = 0x10 + target;
+                    reply.can_dlc = 8;
+                    reply.data[0] = request.data[0];
+                    reply.data[1] = request.data[1];
+                    reply.data[2] = request.data[2];
+                    reply.data[3] = request.data[3];
+                    reply.data[4] = static_cast<uint8_t>(cur & 0xFF);
+                    reply.data[5] = static_cast<uint8_t>((cur >> 8) & 0xFF);
+                    reply.data[6] = static_cast<uint8_t>((cur >> 16) & 0xFF);
+                    reply.data[7] = static_cast<uint8_t>((cur >> 24) & 0xFF);
+                    if (::write(fd, &reply, sizeof(reply)) != sizeof(reply)) running = false;
+                }
+                continue;
+            }
+            if (id == 0x7FF && request.data[2] == 0xCC) {
+                id = request.data[0] | (request.data[1] << 8);
+                ++queries;
+            } else if (id >= 1 && id <= NUM_JOINTS + 1 && request.data[7] == 0xFC) {
+                enabled[id - 1] = true;
+            } else if (id >= 1 && id <= NUM_JOINTS + 1 && request.data[7] == 0xFD) {
+                enabled[id - 1] = false;
+                ++disables;
+            } else if (id >= 1 && id <= NUM_JOINTS + 1) {
+                ++motions;
+            } else {
+                continue;
+            }
+            if (id < 1 || id > NUM_JOINTS + 1) continue;
+            can_frame reply{};
+            reply.can_id = 0x10 + id;
+            reply.can_dlc = 8;
+            const unsigned code = enabled[id - 1] ? 1 : 0;
+            reply.data[0] = static_cast<uint8_t>((code << 4) | id);
+            reply.data[1] = 0x80;
+            reply.data[3] = 0x80;
+            reply.data[4] = 0x08;
+            reply.data[6] = reply.data[7] = 25;
+            if (::write(fd, &reply, sizeof(reply)) != sizeof(reply)) running = false;
+        }
+    });
+
+    try {
+        auto cfg = ArmConfig::defaultJ4310SixAxis();
+        cfg.has_gripper = true;
+        cfg.state_timeout_ms = 200;
+        cfg.command_timeout_ms = 90; // active command watchdog enabled (ROS mode)
+
+        Arm arm(cfg);
+        arm.init();
+        EXPECT_TRUE(arm.configureMotorTimeout(2000, 100), "RID::TIMEOUT (2000) written and verified across all 7 motors");
+        auto rb = arm.queryMotorTimeouts(100);
+        EXPECT_TRUE(rb.size() == 7 && rb[0].has_value() && *rb[0] == 2000 && rb[6].has_value() && *rb[6] == 2000,
+                    "queryMotorTimeouts confirms RID::TIMEOUT == 2000 on joints and gripper");
+
+        EXPECT_TRUE(arm.refreshUntilAllFresh(50), "7-motor (6 joints + gripper) refreshUntilAllFresh succeeds");
+        EXPECT_TRUE(arm.getState().has_gripper && arm.getState().gripper.online, "Gripper reported online");
+
+        arm.enable();
+        EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "7-motor arm+gripper armed");
+        EXPECT_TRUE(arm.getState().gripper.enabled, "Gripper confirmed enabled");
+
+        const unsigned q_before = queries.load();
+        std::array<MITParam, NUM_JOINTS> arm_cmds;
+        arm_cmds.fill(MITParam{10.0, 0.5, 0.0, 0.0, 0.0});
+        MITParam grip_cmd{5.0, 0.1, 0.0, 0.0, 0.0};
+
+        // Feed periodic MIT commands for 200ms (at 50Hz / 20ms period): no redundant 0xCC queries should occur
+        for (int k = 0; k < 10; ++k) {
+            arm.sendMITAll(arm_cmds, grip_cmd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Periodic 7-axis sendMITAll keeps arm ARMED");
+        EXPECT_TRUE(queries.load() == q_before, "No redundant 0xCC queries emitted when command_timeout_ms > 0");
+        EXPECT_TRUE(motions.load() >= 70, "All 7 motor MIT frames sent each cycle");
+
+        // Now freeze caller (no commands sent for > command_timeout_ms): watchdog MUST trigger FAULT & disable!
+        const unsigned disables_before = disables.load();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (arm.status() != ArmStatus::FAULT && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        EXPECT_TRUE(arm.status() == ArmStatus::FAULT, "Command watchdog autonomously enters FAULT on host stall");
+        EXPECT_TRUE(disables.load() >= disables_before + 7, "Watchdog sent disable_all to all 7 motors on stall");
+        EXPECT_TRUE(queries.load() == q_before, "Watchdog did NOT feed motor via 0xCC during stall");
+
+        arm.clearFault();
+        EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "Recovered from command watchdog FAULT cleanly");
+    } catch (...) {
+        running = false;
+        simulator.join();
+        ::close(fd);
+        throw;
+    }
+
+    running = false;
+    simulator.join();
+    ::close(fd);
+}
+
 } // namespace
 
 int main() {
     testArmConfigAndYaml();
     testStrictEnableAndReinitSafety();
     testStrictFaultRecoveryAndBatchCommandFailures();
+    testGripperAndCommandWatchdog();
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "Arm Tests Passed: " << g_passed << " | Failed: " << g_failed << std::endl;
