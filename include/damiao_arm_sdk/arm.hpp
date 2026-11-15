@@ -48,6 +48,7 @@ public:
     bool configureMotorTimeout(uint32_t raw_timeout_reg, int timeout_ms = 100);
 
     // 4. 安全检查与故障接管
+    // joint_idx 必须小于 config().joint_count；数组接口只处理此前缀，容量仍为 NUM_JOINTS。
     bool checkHealth();
     bool validateCommand(std::size_t joint_idx, const MITParam& cmd) const;
     bool validateCommand(const std::array<MITParam, NUM_JOINTS>& cmds) const;
@@ -59,6 +60,7 @@ public:
     void enterFault(const std::string& reason);
 
     // 5. 控制指令接口（要求处于 ARMED 状态且通过 checkHealth + validateCommand + 发送结果校验）
+    // All 接口只发送配置的活动关节；未使用的数组元素不参与校验或发送。
     void sendMIT(std::size_t joint_idx, const MITParam& cmd);
     void sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds);
     void sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds, const MITParam& gripper_cmd);
@@ -91,7 +93,7 @@ private:
     ArmConfig config_;
     ArmStatus status_{ArmStatus::DISCONNECTED};
     ArmState state_{};
-    std::array<int, NUM_JOINTS> joint_to_dev_idx_{0, 1, 2, 3, 4, 5};
+    std::array<int, NUM_JOINTS> joint_to_dev_idx_{-1, -1, -1, -1, -1, -1};
     int gripper_dev_idx_{-1};
     std::chrono::steady_clock::time_point last_command_time_{};
     mutable std::recursive_mutex mutex_;

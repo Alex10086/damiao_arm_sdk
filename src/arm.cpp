@@ -79,7 +79,7 @@ void validateJointConfig(const JointConfig& j,
     if (j.send_can_id == 0 || j.send_can_id > 0x7FF) {
         throw std::invalid_argument("ArmConfig: invalid send_can_id at " + label);
     }
-    if (j.recv_can_id == 0 || j.recv_can_id > 0x7FF) {
+    if (j.recv_can_id > 0x7FF) {
         throw std::invalid_argument("ArmConfig: invalid recv_can_id at " + label);
     }
     if (!send_ids.insert(j.send_can_id).second) {
@@ -140,14 +140,14 @@ void boundedDrainSocket(openarm::canbus::CANSocket& sock, bool enable_fd, int ma
     }
 }
 
-std::optional<uint32_t> transactTimeoutRegister(openarm::canbus::CANSocket& sock,
+std::optional<uint32_t> transactUintRegister(openarm::canbus::CANSocket& sock,
                                                 bool enable_fd,
                                                 uint32_t send_can_id,
                                                 uint32_t recv_can_id,
+                                                uint8_t rid,
                                                 uint8_t cmd,
                                                 uint32_t write_val,
                                                 int timeout_ms) {
-    constexpr uint8_t kTimeoutRid = static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT);
     bool sent = false;
     if (enable_fd) {
         canfd_frame f{};
@@ -157,7 +157,7 @@ std::optional<uint32_t> transactTimeoutRegister(openarm::canbus::CANSocket& sock
         f.data[0] = static_cast<uint8_t>(send_can_id & 0xFF);
         f.data[1] = static_cast<uint8_t>((send_can_id >> 8) & 0xFF);
         f.data[2] = cmd;
-        f.data[3] = kTimeoutRid;
+        f.data[3] = rid;
         f.data[4] = static_cast<uint8_t>(write_val & 0xFF);
         f.data[5] = static_cast<uint8_t>((write_val >> 8) & 0xFF);
         f.data[6] = static_cast<uint8_t>((write_val >> 16) & 0xFF);
@@ -170,7 +170,7 @@ std::optional<uint32_t> transactTimeoutRegister(openarm::canbus::CANSocket& sock
         f.data[0] = static_cast<uint8_t>(send_can_id & 0xFF);
         f.data[1] = static_cast<uint8_t>((send_can_id >> 8) & 0xFF);
         f.data[2] = cmd;
-        f.data[3] = kTimeoutRid;
+        f.data[3] = rid;
         f.data[4] = static_cast<uint8_t>(write_val & 0xFF);
         f.data[5] = static_cast<uint8_t>((write_val >> 8) & 0xFF);
         f.data[6] = static_cast<uint8_t>((write_val >> 16) & 0xFF);
@@ -216,7 +216,7 @@ std::optional<uint32_t> transactTimeoutRegister(openarm::canbus::CANSocket& sock
         const uint16_t from_id = static_cast<uint16_t>(rx_data[0]) |
                                  (static_cast<uint16_t>(rx_data[1]) << 8);
         if (rx_id == recv_can_id && from_id == send_can_id &&
-            rx_data[2] == cmd && rx_data[3] == kTimeoutRid) {
+            rx_data[2] == cmd && rx_data[3] == rid) {
             return static_cast<uint32_t>(rx_data[4]) |
                    (static_cast<uint32_t>(rx_data[5]) << 8) |
                    (static_cast<uint32_t>(rx_data[6]) << 16) |
@@ -278,6 +278,9 @@ ArmConfig ArmConfig::fromYaml(const std::string& yaml_path) {
         }
         std::string t = trim(line);
         if (t.empty()) continue;
+        if (line.find_first_not_of(" \t") == 0 && t.front() != '-') {
+            section = Section::TOP;
+        }
 
         if (t == "joints:") {
             section = Section::JOINTS;
@@ -289,12 +292,12 @@ ArmConfig ArmConfig::fromYaml(const std::string& yaml_path) {
             continue;
         }
 
-        if (section == Section::JOINTS && t.rfind("- ", 0) == 0) {
+        if (section == Section::JOINTS && (t == "-" || t.rfind("- ", 0) == 0)) {
             current_joint++;
             if (current_joint >= static_cast<int>(NUM_JOINTS)) {
                 throw std::runtime_error("ArmConfig::fromYaml: more than 6 joints in '" + yaml_path + "'");
             }
-            t = trim(t.substr(2));
+            t = trim(t.substr(1));
             if (t.empty()) continue;
         }
 
@@ -307,6 +310,13 @@ ArmConfig ArmConfig::fromYaml(const std::string& yaml_path) {
 
         if (section == Section::TOP) {
             if (key == "can_interface")           cfg.can_interface = val;
+            else if (key == "joint_count") {
+                const auto count = std::stoul(val);
+                if (count == 0 || count > NUM_JOINTS) {
+                    throw std::invalid_argument("ArmConfig: joint_count must be in [1, 6]");
+                }
+                cfg.joint_count = static_cast<std::size_t>(count);
+            }
             else if (key == "enable_fd")          cfg.enable_fd = (val == "true" || val == "1");
             else if (key == "state_timeout_ms")   cfg.state_timeout_ms = static_cast<uint32_t>(std::stoul(val));
             else if (key == "command_timeout_ms") cfg.command_timeout_ms = static_cast<uint32_t>(std::stoul(val));
@@ -324,8 +334,8 @@ ArmConfig ArmConfig::fromYaml(const std::string& yaml_path) {
         }
     }
 
-    if (current_joint >= 0 && current_joint + 1 != static_cast<int>(NUM_JOINTS)) {
-        throw std::runtime_error("ArmConfig::fromYaml: expected exactly 6 joints, got " +
+    if (current_joint + 1 != static_cast<int>(cfg.joint_count)) {
+        throw std::runtime_error("ArmConfig::fromYaml: expected " + std::to_string(cfg.joint_count) + " joints, got " +
                                  std::to_string(current_joint + 1));
     }
 
@@ -337,11 +347,14 @@ void ArmConfig::validate() const {
     if (can_interface.empty()) {
         throw std::invalid_argument("ArmConfig: can_interface cannot be empty");
     }
+    if (joint_count == 0 || joint_count > NUM_JOINTS) {
+        throw std::invalid_argument("ArmConfig: joint_count must be in [1, 6]");
+    }
 
     std::set<uint32_t> send_ids;
     std::set<uint32_t> recv_ids;
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < joint_count; ++i) {
         validateJointConfig(joints[i], "joint " + std::to_string(i), send_ids, recv_ids);
     }
     if (has_gripper) {
@@ -355,9 +368,13 @@ void ArmConfig::validate() const {
 
 Arm::Arm(const ArmConfig& config) : config_(config) {
     config_.validate();
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         state_.joints[i].send_can_id = config_.joints[i].send_can_id;
         state_.joints[i].recv_can_id = config_.joints[i].recv_can_id;
+    }
+    for (std::size_t i = config_.joint_count; i < NUM_JOINTS; ++i) {
+        state_.joints[i].online = false;
+        state_.joints[i].stale = true;
     }
     state_.has_gripper = config_.has_gripper;
     if (config_.has_gripper) {
@@ -397,15 +414,15 @@ void Arm::init() {
     std::vector<uint32_t> send_ids(motor_count);
     std::vector<uint32_t> recv_ids(motor_count);
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         types[i] = config_.joints[i].motor_type;
         send_ids[i] = config_.joints[i].send_can_id;
         recv_ids[i] = config_.joints[i].recv_can_id;
     }
     if (config_.has_gripper) {
-        types[NUM_JOINTS] = config_.gripper.motor_type;
-        send_ids[NUM_JOINTS] = config_.gripper.send_can_id;
-        recv_ids[NUM_JOINTS] = config_.gripper.recv_can_id;
+        types[config_.joint_count] = config_.gripper.motor_type;
+        send_ids[config_.joint_count] = config_.gripper.send_can_id;
+        recv_ids[config_.joint_count] = config_.gripper.recv_can_id;
     }
 
     openarm_ = std::make_unique<openarm::can::socket::OpenArm>(config_.can_interface, config_.enable_fd);
@@ -416,7 +433,8 @@ void Arm::init() {
 
     // 建立关节索引 -> OpenArm 内部设备索引的映射（OpenArm 内部 map 按 recv_can_id 排序）
     auto motors = openarm_->get_arm().get_motors();
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    joint_to_dev_idx_.fill(-1);
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         for (std::size_t dev_i = 0; dev_i < motors.size(); ++dev_i) {
             if (motors[dev_i].get_recv_can_id() == config_.joints[i].recv_can_id) {
                 joint_to_dev_idx_[i] = static_cast<int>(dev_i);
@@ -491,8 +509,8 @@ void Arm::monitorLoop() {
 }
 
 int Arm::resolveDeviceIndex(std::size_t joint_idx) const {
-    if (joint_idx >= NUM_JOINTS) {
-        throw std::out_of_range("Arm: joint_idx out of range [0, 5]");
+    if (joint_idx >= config_.joint_count) {
+        throw std::out_of_range("Arm: joint_idx exceeds configured joint_count");
     }
     return joint_to_dev_idx_[joint_idx];
 }
@@ -521,7 +539,7 @@ bool Arm::pollUntilAllRespond(const std::array<uint64_t, NUM_JOINTS>& baseline_r
         openarm_->recv_all(slice_us);
 
         bool all_replied = true;
-        for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
             if (!motorConfirmed(joint_to_dev_idx_[i], baseline_responses[i])) {
                 all_replied = false;
                 break;
@@ -584,7 +602,7 @@ void Arm::syncStateFromOpenArm() {
         }
     };
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         syncOne(joint_to_dev_idx_[i], config_.joints[i], state_.joints[i]);
     }
     state_.has_gripper = config_.has_gripper;
@@ -656,7 +674,7 @@ bool Arm::checkHealth() {
         return true;
     };
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         if (!checkJointHealth(config_.joints[i], state_.joints[i])) {
             return false;
         }
@@ -698,23 +716,25 @@ void Arm::enable() {
         }
     };
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         checkPreEnable(config_.joints[i], state_.joints[i]);
     }
     if (config_.has_gripper) {
         checkPreEnable(config_.gripper, state_.gripper);
     }
 
-    // 若配置了非 MIT 模式，在 PARAM 回调模式下同步对应关节的控制模式并排空寄存器应答帧
+    // 非 MIT 模式切换按电机 ID/RID 回读确认，隔离排队状态帧与寄存器应答。
     bool any_non_mit = (config_.has_gripper && config_.gripper.control_mode != ControlMode::MIT);
-    for (std::size_t i = 0; i < NUM_JOINTS && !any_non_mit; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count && !any_non_mit; ++i) {
         if (config_.joints[i].control_mode != ControlMode::MIT) {
             any_non_mit = true;
         }
     }
     if (any_non_mit) {
-        StateCallbackGuard guard{*openarm_, openarm_->get_master_can_device_collection().get_can_socket(), config_.enable_fd};
-        openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::PARAM);
+        auto& can_sock = openarm_->get_master_can_device_collection().get_can_socket();
+        StateCallbackGuard guard{*openarm_, can_sock, config_.enable_fd};
+        openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::IGNORE);
+        boundedDrainSocket(can_sock, config_.enable_fd);
         auto syncModeOne = [&](int dev_idx, const JointConfig& jc) {
             if (jc.control_mode != ControlMode::MIT) {
                 uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
@@ -723,15 +743,21 @@ void Arm::enable() {
                     enterFault("Arm::enable: failed to write control mode on " + jc.name);
                     throw std::runtime_error(state_.fault_reason);
                 }
+                const auto readback = transactUintRegister(
+                    can_sock, config_.enable_fd, jc.send_can_id, jc.recv_can_id,
+                    static_cast<uint8_t>(openarm::damiao_motor::RID::CTRL_MODE), 0x33, 0, 50);
+                if (!readback || *readback != static_cast<uint32_t>(jc.control_mode)) {
+                    enterFault("Arm::enable: control mode readback failed on " + jc.name);
+                    throw std::runtime_error(state_.fault_reason);
+                }
             }
         };
-        for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+        for (std::size_t i = 0; i < config_.joint_count; ++i) {
             syncModeOne(resolveDeviceIndex(i), config_.joints[i]);
         }
         if (config_.has_gripper) {
             syncModeOne(gripper_dev_idx_, config_.gripper);
         }
-        openarm_->recv_all(config_.recv_timeout_us);
     }
     if (any_non_mit) {
         syncStateFromOpenArm();
@@ -741,7 +767,7 @@ void Arm::enable() {
     const std::size_t motor_count = config_.activeMotorCount();
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint64_t, NUM_JOINTS> prev_responses{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
     }
     uint64_t prev_gripper_responses =
@@ -768,7 +794,7 @@ void Arm::enable() {
         }
     };
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         checkConfirmedEnabled(config_.joints[i], state_.joints[i], prev_responses[i]);
     }
     if (config_.has_gripper) {
@@ -789,7 +815,7 @@ void Arm::disable() {
     // 先排空滞留帧再采集失能确认基线
     openarm_->recv_all(0);
     std::array<uint64_t, NUM_JOINTS> prev_responses{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
     }
     uint64_t prev_gripper_responses =
@@ -802,7 +828,8 @@ void Arm::disable() {
     syncStateFromOpenArm();
 
     bool confirmed = written && replied && state_.bus_healthy;
-    for (const auto& joint : state_.joints) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
+        const auto& joint = state_.joints[i];
         confirmed = confirmed && joint.online && !joint.stale && !joint.enabled && !joint.has_fault;
     }
     if (config_.has_gripper) {
@@ -829,7 +856,7 @@ void Arm::clearFault() {
     // 若故障条件（总线异常、电机离线/反馈过期、电机硬件故障或仍处于使能）未消除，禁止退出 FAULT
     openarm_->clear_bus_status();
     std::array<uint64_t, NUM_JOINTS> prev_responses{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
     }
     uint64_t prev_gripper_responses =
@@ -866,7 +893,7 @@ void Arm::clearFault() {
         }
     };
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         verifyCleared(config_.joints[i], state_.joints[i], prev_responses[i]);
     }
     if (config_.has_gripper) {
@@ -902,7 +929,7 @@ bool Arm::refreshUntilAllFresh(int timeout_ms) {
 
     openarm_->recv_all(0);
     std::array<uint64_t, NUM_JOINTS> prev_responses{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         prev_responses[i] = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]).responses;
     }
     uint64_t prev_gripper_responses =
@@ -943,17 +970,17 @@ std::vector<std::optional<uint32_t>> Arm::queryMotorTimeouts(int timeout_ms) {
 
     const int per_motor_ms = std::max(15, timeout_ms);
     std::vector<std::optional<uint32_t>> results(config_.activeMotorCount(), std::nullopt);
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
-        results[i] = transactTimeoutRegister(
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
+        results[i] = transactUintRegister(
             can_sock, config_.enable_fd,
             config_.joints[i].send_can_id, config_.joints[i].recv_can_id,
-            0x33, 0, per_motor_ms);
+            static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT), 0x33, 0, per_motor_ms);
     }
     if (config_.has_gripper) {
-        results[NUM_JOINTS] = transactTimeoutRegister(
+        results[config_.joint_count] = transactUintRegister(
             can_sock, config_.enable_fd,
             config_.gripper.send_can_id, config_.gripper.recv_can_id,
-            0x33, 0, per_motor_ms);
+            static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT), 0x33, 0, per_motor_ms);
     }
     return results;
 }
@@ -971,19 +998,19 @@ bool Arm::configureMotorTimeout(uint32_t raw_timeout_reg, int timeout_ms) {
 
     const int per_motor_ms = std::max(15, timeout_ms);
     auto writeAndVerifyOne = [&](const JointConfig& jc) -> bool {
-        auto ack = transactTimeoutRegister(
+        auto ack = transactUintRegister(
             can_sock, config_.enable_fd, jc.send_can_id, jc.recv_can_id,
-            0x55, raw_timeout_reg, per_motor_ms);
+            static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT), 0x55, raw_timeout_reg, per_motor_ms);
         if (!ack.has_value()) {
             return false;
         }
-        auto readback = transactTimeoutRegister(
+        auto readback = transactUintRegister(
             can_sock, config_.enable_fd, jc.send_can_id, jc.recv_can_id,
-            0x33, 0, per_motor_ms);
+            static_cast<uint8_t>(openarm::damiao_motor::RID::TIMEOUT), 0x33, 0, per_motor_ms);
         return readback.has_value() && *readback == raw_timeout_reg;
     };
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         if (!writeAndVerifyOne(config_.joints[i])) {
             return false;
         }
@@ -999,12 +1026,12 @@ bool Arm::configureMotorTimeout(uint32_t raw_timeout_reg, int timeout_ms) {
 // ============================================================================
 
 bool Arm::validateCommand(std::size_t joint_idx, const MITParam& cmd) const {
-    if (joint_idx >= NUM_JOINTS) return false;
+    if (joint_idx >= config_.joint_count) return false;
     return validateMitLimits(config_.joints[joint_idx], cmd);
 }
 
 bool Arm::validateCommand(const std::array<MITParam, NUM_JOINTS>& cmds) const {
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         if (!validateCommand(i, cmds[i])) return false;
     }
     return true;
@@ -1016,7 +1043,7 @@ bool Arm::validateGripperCommand(const MITParam& cmd) const {
 }
 
 bool Arm::validateCommand(std::size_t joint_idx, const PosVelParam& cmd) const {
-    if (joint_idx >= NUM_JOINTS) return false;
+    if (joint_idx >= config_.joint_count) return false;
     const auto& jc = config_.joints[joint_idx];
     if (jc.control_mode != ControlMode::POS_VEL) return false;
 
@@ -1027,14 +1054,14 @@ bool Arm::validateCommand(std::size_t joint_idx, const PosVelParam& cmd) const {
 }
 
 bool Arm::validateCommand(const std::array<PosVelParam, NUM_JOINTS>& cmds) const {
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         if (!validateCommand(i, cmds[i])) return false;
     }
     return true;
 }
 
 bool Arm::validateCommand(std::size_t joint_idx, const VelParam& cmd) const {
-    if (joint_idx >= NUM_JOINTS) return false;
+    if (joint_idx >= config_.joint_count) return false;
     const auto& jc = config_.joints[joint_idx];
     if (jc.control_mode != ControlMode::VEL) return false;
 
@@ -1044,7 +1071,7 @@ bool Arm::validateCommand(std::size_t joint_idx, const VelParam& cmd) const {
 }
 
 bool Arm::validateCommand(const std::array<VelParam, NUM_JOINTS>& cmds) const {
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         if (!validateCommand(i, cmds[i])) return false;
     }
     return true;
@@ -1060,7 +1087,7 @@ void Arm::verifySendSucceeded(const char* api_name,
                               const std::array<uint32_t, NUM_JOINTS>& prev_rejected,
                               uint32_t prev_gripper_rejected) {
     // 检查是否有指令被 OpenArm 内部因模式不匹配而拒绝
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         const auto& link = openarm_->get_arm().get_link_stats(joint_to_dev_idx_[i]);
         state_.joints[i].commands_sent = link.commands_sent;
         state_.joints[i].rejected_commands = link.rejected_commands;
@@ -1115,7 +1142,7 @@ void Arm::sendMIT(std::size_t joint_idx, const MITParam& cmd) {
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
 
     openarm_->get_arm().mit_control_one(resolveDeviceIndex(joint_idx), cmd);
     verifySendSucceeded("Arm::sendMIT", prev_writes, 1, prev_rej, state_.gripper.rejected_commands);
@@ -1135,12 +1162,12 @@ void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds) {
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         openarm_->get_arm().mit_control_one(resolveDeviceIndex(i), cmds[i]);
     }
-    verifySendSucceeded("Arm::sendMITAll", prev_writes, NUM_JOINTS, prev_rej, state_.gripper.rejected_commands);
+    verifySendSucceeded("Arm::sendMITAll", prev_writes, config_.joint_count, prev_rej, state_.gripper.rejected_commands);
 }
 
 void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds, const MITParam& gripper_cmd) {
@@ -1160,14 +1187,14 @@ void Arm::sendMITAll(const std::array<MITParam, NUM_JOINTS>& cmds, const MITPara
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
     uint32_t prev_gripper_rej = state_.gripper.rejected_commands;
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         openarm_->get_arm().mit_control_one(resolveDeviceIndex(i), cmds[i]);
     }
     openarm_->get_arm().mit_control_one(gripper_dev_idx_, gripper_cmd);
-    verifySendSucceeded("Arm::sendMITAll", prev_writes, NUM_JOINTS + 1, prev_rej, prev_gripper_rej);
+    verifySendSucceeded("Arm::sendMITAll", prev_writes, config_.activeMotorCount(), prev_rej, prev_gripper_rej);
 }
 
 void Arm::sendGripperMIT(const MITParam& cmd) {
@@ -1187,7 +1214,7 @@ void Arm::sendGripperMIT(const MITParam& cmd) {
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
     uint32_t prev_gripper_rej = state_.gripper.rejected_commands;
 
     openarm_->get_arm().mit_control_one(gripper_dev_idx_, cmd);
@@ -1208,7 +1235,7 @@ void Arm::sendPosVel(std::size_t joint_idx, const PosVelParam& cmd) {
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
 
     openarm_->get_arm().posvel_control_one(resolveDeviceIndex(joint_idx), cmd);
     verifySendSucceeded("Arm::sendPosVel", prev_writes, 1, prev_rej, state_.gripper.rejected_commands);
@@ -1228,12 +1255,12 @@ void Arm::sendPosVelAll(const std::array<PosVelParam, NUM_JOINTS>& cmds) {
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         openarm_->get_arm().posvel_control_one(resolveDeviceIndex(i), cmds[i]);
     }
-    verifySendSucceeded("Arm::sendPosVelAll", prev_writes, NUM_JOINTS, prev_rej, state_.gripper.rejected_commands);
+    verifySendSucceeded("Arm::sendPosVelAll", prev_writes, config_.joint_count, prev_rej, state_.gripper.rejected_commands);
 }
 
 void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
@@ -1250,7 +1277,7 @@ void Arm::sendVel(std::size_t joint_idx, const VelParam& cmd) {
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
 
     openarm_->get_arm().vel_control_one(resolveDeviceIndex(joint_idx), cmd);
     verifySendSucceeded("Arm::sendVel", prev_writes, 1, prev_rej, state_.gripper.rejected_commands);
@@ -1270,12 +1297,12 @@ void Arm::sendVelAll(const std::array<VelParam, NUM_JOINTS>& cmds) {
 
     uint64_t prev_writes = openarm_->get_bus_status().writes_ok;
     std::array<uint32_t, NUM_JOINTS> prev_rej{};
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
+    for (std::size_t i = 0; i < config_.joint_count; ++i) prev_rej[i] = state_.joints[i].rejected_commands;
 
-    for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
         openarm_->get_arm().vel_control_one(resolveDeviceIndex(i), cmds[i]);
     }
-    verifySendSucceeded("Arm::sendVelAll", prev_writes, NUM_JOINTS, prev_rej, state_.gripper.rejected_commands);
+    verifySendSucceeded("Arm::sendVelAll", prev_writes, config_.joint_count, prev_rej, state_.gripper.rejected_commands);
 }
 
 openarm::can::socket::OpenArm& Arm::rawOpenArm() {

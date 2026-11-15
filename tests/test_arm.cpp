@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <linux/can.h>
@@ -119,6 +120,27 @@ void testArmConfigAndYaml() {
 
     ArmConfig def_cfg = ArmConfig::defaultJ4310SixAxis("vcan0");
     EXPECT_TRUE(def_cfg.joints.size() == 6, "Default config has 6 joints");
+    EXPECT_TRUE(def_cfg.joint_count == NUM_JOINTS && def_cfg.activeMotorCount() == 6,
+                "Default active count remains six");
+    auto count_cfg = def_cfg;
+    count_cfg.joint_count = 0;
+    EXPECT_THROW(count_cfg.validate(), std::invalid_argument, "Zero active joints rejected");
+    count_cfg.joint_count = NUM_JOINTS + 1;
+    EXPECT_THROW(count_cfg.validate(), std::invalid_argument, "More than six active joints rejected");
+    count_cfg.joint_count = 1;
+    count_cfg.joints[0].recv_can_id = 0;
+    count_cfg.joints[1] = count_cfg.joints[0];
+    count_cfg.validate();
+    EXPECT_TRUE(count_cfg.activeMotorCount() == 1, "Inactive duplicate IDs are ignored, receive ID zero accepted");
+    count_cfg.joint_count = 2;
+    EXPECT_THROW(count_cfg.validate(), std::invalid_argument, "Duplicate active send IDs rejected");
+    count_cfg.joints[1].send_can_id = 2;
+    EXPECT_THROW(count_cfg.validate(), std::invalid_argument, "Duplicate active receive ID zero rejected");
+    count_cfg.joint_count = 1;
+    count_cfg.has_gripper = true;
+    EXPECT_TRUE(count_cfg.activeMotorCount() == 2, "Gripper follows configured active prefix");
+    count_cfg.gripper.recv_can_id = 0;
+    EXPECT_THROW(count_cfg.validate(), std::invalid_argument, "Gripper cannot duplicate active receive ID zero");
     EXPECT_TRUE(def_cfg.joints[0].send_can_id == 0x01 && def_cfg.joints[5].send_can_id == 0x06,
                 "Default send CAN IDs 0x01..0x06");
     EXPECT_TRUE(def_cfg.joints[0].recv_can_id == 0x11 && def_cfg.joints[5].recv_can_id == 0x16,
@@ -135,6 +157,46 @@ void testArmConfigAndYaml() {
 
     ArmConfig yaml_cfg = ArmConfig::fromYaml(std::string(DAMIAO_SOURCE_DIR) + "/config/arm.yaml");
     EXPECT_TRUE(yaml_cfg.can_interface == "vcan0" && !yaml_cfg.enable_fd, "YAML loaded can_interface and enable_fd");
+    EXPECT_TRUE(yaml_cfg.joint_count == NUM_JOINTS, "YAML without joint_count retains six active joints");
+    auto loadTemporaryYaml = [](const std::string& contents) {
+        char path[] = "/tmp/damiao_arm_config_XXXXXX";
+        const int fd = ::mkstemp(path);
+        if (fd < 0) throw std::runtime_error("Cannot create temporary YAML");
+        const auto written = ::write(fd, contents.data(), contents.size());
+        ::close(fd);
+        if (written != static_cast<ssize_t>(contents.size())) {
+            ::unlink(path);
+            throw std::runtime_error("Cannot write temporary YAML");
+        }
+        try {
+            auto cfg = ArmConfig::fromYaml(path);
+            ::unlink(path);
+            return cfg;
+        } catch (...) {
+            ::unlink(path);
+            throw;
+        }
+    };
+    const std::string single_joint_yaml =
+        "can_interface: vcan0\njoints:\n"
+        "  - name: single\n"
+        "    motor_type: DM3507\n"
+        "    send_can_id: 1\n"
+        "    recv_can_id: 0\n"
+        "    control_mode: MIT\n"
+        "    pos_min: -12.566\n"
+        "    pos_max: 12.566\n"
+        "    vel_max: 50\n"
+        "    tau_max: 5\n";
+    const auto single_yaml = loadTemporaryYaml("joint_count: 1\n" + single_joint_yaml);
+    EXPECT_TRUE(single_yaml.joint_count == 1 && single_yaml.activeMotorCount() == 1 &&
+                single_yaml.joints[0].recv_can_id == 0 &&
+                single_yaml.joints[0].motor_type == MotorType::DM3507,
+                "Single DM3507 YAML loads receive ID zero");
+    EXPECT_THROW(loadTemporaryYaml("joint_count: 2\n" + single_joint_yaml),
+                 std::runtime_error, "YAML joint count must match declared active count");
+    EXPECT_THROW(loadTemporaryYaml(single_joint_yaml), std::runtime_error,
+                 "Omitting joint_count still requires six YAML entries");
     for (std::size_t i = 0; i < NUM_JOINTS; ++i) {
         EXPECT_TRUE(yaml_cfg.joints[i].send_can_id == i + 1, "YAML joint send_can_id matches");
         EXPECT_TRUE(yaml_cfg.joints[i].recv_can_id == i + 1 + 0x10, "YAML joint recv_can_id matches");
@@ -459,6 +521,152 @@ void testGripperAndCommandWatchdog() {
     ::close(fd);
 }
 
+void testSingleMotorActivePrefix(ControlMode mode) {
+    std::cout << "[TEST] Single DM3507, receive ID zero, mode "
+              << static_cast<int>(mode) << "..." << std::endl;
+    const int fd = openRawVcanSocket();
+    if (fd < 0) throw std::runtime_error("Cannot open simulator socket");
+    std::atomic<bool> running{true}, inject_fault{false};
+    std::atomic<unsigned> disables{0};
+    const uint32_t motion_id = mode == ControlMode::MIT ? 1 :
+                               mode == ControlMode::POS_VEL ? 0x101 : 0x201;
+    std::thread simulator([&] {
+        bool enabled = false;
+        ControlMode motor_mode = ControlMode::MIT;
+        while (running.load()) {
+            pollfd pfd{fd, POLLIN, 0};
+            if (::poll(&pfd, 1, 2) <= 0) continue;
+            can_frame request{};
+            if (::read(fd, &request, sizeof(request)) != sizeof(request)) continue;
+            if (request.can_id == 0x7FF && request.can_dlc == 8 &&
+                request.data[0] == 1 && request.data[1] == 0 &&
+                (request.data[2] == 0x55 || request.data[2] == 0x33) && request.data[3] == 10) {
+                if (request.data[2] == 0x55) {
+                    motor_mode = static_cast<ControlMode>(request.data[4]);
+                    // Real USB-CAN ordering: queued state precedes a delayed mode ACK.
+                    const can_frame queued{0, 8, 0, 0, 0, {1, 0x80, 0, 0x80, 8, 0, 25, 25}};
+                    if (::write(fd, &queued, sizeof(queued)) != sizeof(queued)) running = false;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                can_frame reply = request;
+                reply.can_id = 0;
+                const auto value = static_cast<uint32_t>(motor_mode);
+                std::memcpy(reply.data + 4, &value, sizeof(value));
+                if (::write(fd, &reply, sizeof(reply)) != sizeof(reply)) running = false;
+                continue;
+            }
+            const bool query = request.can_id == 0x7FF && request.data[2] == 0xCC;
+            if (query) {
+                if ((request.data[0] | (request.data[1] << 8)) != 1) {
+                    continue;
+                }
+            } else if (request.can_id == 1 && request.can_dlc == 8 &&
+                       request.data[7] == 0xFC) {
+                enabled = true;
+            } else if (request.can_id == 1 && request.can_dlc == 8 &&
+                       request.data[7] == 0xFD) {
+                enabled = false;
+                ++disables;
+            } else if (request.can_id != motion_id || motor_mode != mode) {
+                continue;
+            }
+            can_frame reply{};
+            reply.can_id = 0;
+            reply.can_dlc = 8;
+            const unsigned code = inject_fault.load() ? 9 : (enabled ? 1 : 0);
+            reply.data[0] = static_cast<uint8_t>((code << 4) | 1);
+            // Midpoint protocol values represent near-zero DM3507 feedback.
+            reply.data[1] = 0x80;
+            reply.data[3] = 0x80;
+            reply.data[4] = 0x08;
+            reply.data[6] = reply.data[7] = 25;
+            if (::write(fd, &reply, sizeof(reply)) != sizeof(reply)) running = false;
+        }
+    });
+    try {
+        auto cfg = ArmConfig::defaultJ4310SixAxis();
+        cfg.joint_count = 1;
+        cfg.joints[0].motor_type = MotorType::DM3507;
+        cfg.joints[0].recv_can_id = 0;
+        cfg.joints[0].control_mode = mode;
+        cfg.joints[0].pos_min = -12.566;
+        cfg.joints[0].pos_max = 12.566;
+        cfg.joints[0].vel_max = 50;
+        cfg.joints[0].tau_max = 5;
+        cfg.state_timeout_ms = 200;
+        // Deliberately unusable inactive entries must never affect the live motor.
+        for (std::size_t i = 1; i < NUM_JOINTS; ++i) cfg.joints[i] = cfg.joints[0];
+        cfg.validate();
+        Arm arm(cfg);
+        arm.init();
+        EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "Single motor initializes disarmed");
+        EXPECT_TRUE(arm.refreshUntilAllFresh(100), "Only active motor must respond to refresh");
+        const auto state = arm.refresh(5000);
+        EXPECT_TRUE(state.all_online && !state.any_fault && state.joints[0].online &&
+                    state.joints[0].recv_can_id == 0, "CAN ID zero feedback reaches active joint");
+        EXPECT_TRUE(arm.checkHealth(), "Five absent inactive motors do not fail health");
+        arm.enable();
+        EXPECT_TRUE(arm.status() == ArmStatus::ARMED, "Single configured motor enables");
+        EXPECT_TRUE(arm.getState().joints[0].malformed_frames == 0 &&
+                    std::abs(arm.getState().joints[0].position) < 0.001,
+                    "Queued state and delayed mode ACK do not corrupt feedback during enable");
+        const MITParam mit{1.0, 0.1, 0.0, 0.0, 0.0};
+        const PosVelParam pos{0.0, 0.1};
+        const VelParam vel{0.1};
+        EXPECT_TRUE(!arm.validateCommand(1, mit) && !arm.validateCommand(1, pos) &&
+                    !arm.validateCommand(1, vel), "All validators reject inactive indices");
+        EXPECT_THROW(arm.sendMIT(1, mit), std::invalid_argument, "MIT rejects inactive index");
+        EXPECT_THROW(arm.sendPosVel(1, pos), std::invalid_argument, "POS_VEL rejects inactive index");
+        EXPECT_THROW(arm.sendVel(1, vel), std::invalid_argument, "VEL rejects inactive index");
+        if (mode == ControlMode::MIT) {
+            std::array<MITParam, NUM_JOINTS> cmds;
+            cmds.fill(MITParam{-1.0, -1.0, 1000.0, 1000.0, 1000.0});
+            cmds[0] = mit;
+            EXPECT_TRUE(arm.validateCommand(cmds), "MIT array ignores invalid inactive commands");
+            arm.sendMIT(0, mit);
+            arm.sendMITAll(cmds);
+        } else if (mode == ControlMode::POS_VEL) {
+            std::array<PosVelParam, NUM_JOINTS> cmds;
+            cmds.fill(PosVelParam{1000.0, 1000.0});
+            cmds[0] = pos;
+            EXPECT_TRUE(arm.validateCommand(cmds), "POS_VEL array ignores inactive commands");
+            arm.sendPosVel(0, pos);
+            arm.sendPosVelAll(cmds);
+        } else {
+            std::array<VelParam, NUM_JOINTS> cmds;
+            cmds.fill(VelParam{1000.0});
+            cmds[0] = vel;
+            EXPECT_TRUE(arm.validateCommand(cmds), "VEL array ignores inactive commands");
+            arm.sendVel(0, vel);
+            arm.sendVelAll(cmds);
+        }
+        arm.disable();
+        EXPECT_TRUE(arm.status() == ArmStatus::DISARMED && !arm.getState().joints[0].enabled,
+                    "Single motor disable requires confirmed feedback");
+        EXPECT_TRUE(arm.refreshUntilAllFresh(100), "Single motor refreshes after disable");
+        arm.enable();
+        const auto before = disables.load();
+        inject_fault = true;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while ((arm.status() != ArmStatus::FAULT || disables.load() == before) &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        EXPECT_TRUE(arm.status() == ArmStatus::FAULT && disables.load() > before,
+                    "Active hardware fault autonomously disables the motor");
+        inject_fault = false;
+        arm.clearFault();
+        EXPECT_TRUE(arm.status() == ArmStatus::DISARMED, "Single motor fault recovery confirmed");
+    } catch (...) {
+        running = false;
+        simulator.join();
+        ::close(fd);
+        throw;
+    }
+    running = false;
+    simulator.join();
+    ::close(fd);
+}
+
 } // namespace
 
 int main() {
@@ -466,6 +674,9 @@ int main() {
     testStrictEnableAndReinitSafety();
     testStrictFaultRecoveryAndBatchCommandFailures();
     testGripperAndCommandWatchdog();
+    testSingleMotorActivePrefix(ControlMode::MIT);
+    testSingleMotorActivePrefix(ControlMode::POS_VEL);
+    testSingleMotorActivePrefix(ControlMode::VEL);
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "Arm Tests Passed: " << g_passed << " | Failed: " << g_failed << std::endl;

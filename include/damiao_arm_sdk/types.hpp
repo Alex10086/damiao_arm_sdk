@@ -56,7 +56,7 @@ struct JointConfig {
     double kd_max{5.0};
 };
 
-// 六轴机械臂（+可选夹爪）统一配置
+// 最多六轴机械臂（+可选夹爪）统一配置；仅 joints 的前 joint_count 项参与运行
 struct ArmConfig {
     std::string can_interface{"vcan0"};
     bool enable_fd{false};
@@ -64,9 +64,10 @@ struct ArmConfig {
     uint32_t command_timeout_ms{0};   // 周期控制看门狗超时 (ms): 0=空闲保活(0xCC), >0=控制停发超时即FAULT
     uint32_t motor_timeout_reg{0};    // 电机端 RID::TIMEOUT (RID 9) 原始 uint32 值: 0=不写入(仅诊断读取), >0=配置阶段写入RAM并回读校验
     int recv_timeout_us{1000};        // 单次 recv_all 首包等待时间 (us)
+    std::size_t joint_count{NUM_JOINTS}; // 活跃关节数 1..6，数组容量保持六轴
     std::array<JointConfig, NUM_JOINTS> joints{};
 
-    // 可选第 7 轴夹爪电机配置（默认关闭，开启后与 6 轴统一管理）
+    // 可选夹爪电机配置（默认关闭，设备索引为 joint_count）
     bool has_gripper{false};
     JointConfig gripper{
         "gripper_joint",
@@ -83,7 +84,7 @@ struct ArmConfig {
     };
 
     std::size_t activeMotorCount() const noexcept {
-        return has_gripper ? (NUM_JOINTS + 1) : NUM_JOINTS;
+        return joint_count + (has_gripper ? 1 : 0);
     }
 
     // 默认 6 轴 J4310 配置（关节 0~5 对应 CAN ID 0x01~0x06，反馈 ID 0x11~0x16）
@@ -120,7 +121,7 @@ struct JointState {
     bool stale{true};
 };
 
-// 六轴机械臂（+可选夹爪）统一状态
+// 最多六轴机械臂（+可选夹爪）统一状态；仅配置的活跃前缀有有效关节状态
 struct ArmState {
     ArmStatus status{ArmStatus::DISCONNECTED};
     std::array<JointState, NUM_JOINTS> joints{};

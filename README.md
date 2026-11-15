@@ -28,7 +28,7 @@ C++17 SDK for **Damiao DM-J4310-2EC (24V)** motors and robotic arms, integrating
 ```
 damiao_arm_sdk/
 ├── include/damiao_arm_sdk/
-│   ├── arm.hpp                    # 6-axis (+ optional gripper) Arm state machine & safety
+│   ├── arm.hpp                    # 1..6 active joints (+ optional gripper), state machine & safety
 │   ├── damiao_usb_transport.hpp   # Damiao USB-CAN (/dev/ttyACM*) 30B TX / 16B RX transport
 │   ├── socketcan_bridge.hpp       # SocketCAN <-> USB-CAN bridge
 │   └── types.hpp                  # ArmConfig, JointConfig, ArmState, JointState
@@ -63,6 +63,53 @@ cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
+## Single J3507 configuration (pure C++ Arm)
+
+`ArmConfig::joint_count` defaults to six and accepts 1..6. Only the first
+`joint_count` entries of the six-element joint/command/state arrays are active;
+inactive entries are ignored, and single-joint APIs reject inactive indices.
+The optional gripper is a separate device at index `joint_count`.
+YAML accepts optional `joint_count` and requires exactly that many `joints`
+entries (six when omitted). This does not change the six-axis ROS 2 robot model.
+
+```cpp
+auto cfg = damiao::ArmConfig::defaultJ4310SixAxis("vcan0");
+cfg.joint_count = 1;
+auto& joint = cfg.joints[0];
+joint.motor_type = damiao::MotorType::DM3507;
+joint.send_can_id = 1;
+joint.recv_can_id = 0; // Standard CAN receive ID zero is valid
+joint.control_mode = damiao::ControlMode::MIT;
+joint.pos_min = -12.5;
+joint.pos_max = 12.5;
+joint.vel_max = 50.0;
+joint.tau_max = 5.0;
+damiao::Arm arm(cfg);
+arm.init(); // No motion; refresh and inspect feedback before enabling
+```
+
+These are protocol limits, not safe experimental motion targets. Use much
+smaller motion/gain limits for an unloaded, secured motor and provide an
+independent stop. `motor_timeout_reg == 0` leaves motor TIMEOUT unchanged:
+a motor already configured with TIMEOUT=0 has no hardware communication-timeout
+protection.
+
+The SDK commit does not change OpenArm's motor range tables. Verify that motor
+RID21/22/23 match the dependency's position/velocity/torque scaling before motion.
+The tested J3507 reports PMAX=12.566, whereas the pinned OpenArm uses 12.5; that
+dependency mismatch is not resolved by this SDK change. `JointConfig` limits
+only validate commands and do not alter protocol encoding or feedback decoding.
+
+`Arm` exposes three motion APIs: MIT (`sendMIT`/`sendMITAll`), POS_VEL
+(`sendPosVel`/`sendPosVelAll`), and VEL (`sendVel`/`sendVelAll`). Each requires
+the matching configured and actual motor mode. `enable()` synchronizes and
+verifies non-MIT modes; MIT requires the motor to already be in MIT mode.
+Lower-level OpenArm additionally supports POS_FORCE, a fourth mode not exposed
+as an Arm motion API. A single-motor check cannot validate simultaneous six-axis
+behavior, bus loading, mechanical coupling, or the ROS 2 six-axis integration.
+This configuration example is not a claim of completed hardware validation.
+
+
 ## Build & Run (ROS 2 Jazzy `ros2_control`)
 
 ```bash
@@ -91,8 +138,9 @@ ros2 launch damiao_arm_bringup damiao_arm.launch.py \
 
 ## Arm 安全行为
 
-- `disable()` 在 50 ms 内等待全部配置电机（6 轴 + 可选夹爪）的新鲜失能反馈，并检查总线、故障码和 enabled 状态；写入失败、缺失反馈或仍使能均锁定 `FAULT` 并抛异常，不会报告 `DISARMED`。原有 `FAULT` 不由 `disable()` 清除。
+- `disable()` 在 50 ms 内等待全部配置电机（`joint_count` 个关节 + 可选夹爪）的新鲜失能反馈，并检查总线、故障码和 enabled 状态；写入失败、缺失反馈或仍使能均锁定 `FAULT` 并抛异常，不会报告 `DISARMED`。原有 `FAULT` 不由 `disable()` 清除。
 - 使能、失能和故障恢复共用 50 ms 状态握手：不仅等待响应计数增长，还等待期望的 enabled 状态，避免在较早的排队反馈到达后提前结束握手。
+- 非 MIT 模式在 `enable()` 内写入 `CTRL_MODE` 后，按反馈 CAN ID、电机 ID、RID 和 `0x33` 回读确认实际模式（每台最多 50 ms）；排队状态帧及 `0x55` 写应答不交给状态解析器。缺失或不符的回读拒绝使能并进入 `FAULT`。
 - **双模式后台线程**：
   - **Standalone 空闲模式（`command_timeout_ms == 0`，默认）**：`ARMED` 时后台线程每 `min(100 ms, state_timeout_ms / 3)` 查询全部电机状态，上层可不发运动命令；反馈过期或硬件故障进入 `FAULT`。
   - **ROS 周期控制看门狗模式（`command_timeout_ms > 0`，`ros2_control` 默认 `100 ms`）**：正常控制周期内不发冗余 `0xCC` 查询帧；一旦上层控制循环卡死超过 `command_timeout_ms` 未写入控制帧，后台线程独立触发 `enterFault()` 失能全部电机，且不会发送 `0xCC` 误喂电机端看门狗。
