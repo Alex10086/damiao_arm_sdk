@@ -1,0 +1,157 @@
+<?xml version="1.0"?>
+<robot name="robot">
+  <link name="base">
+    <inertial>
+      <origin xyz="-0.00248207 1e-8 0.03784448" rpy="0 0 0"/>
+      <mass value="0.3764035"/>
+      <inertia ixx="0.00019685" ixy="0" ixz="-0.00002405" iyy="0.00024222" iyz="0" izz="0.00023206"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/base_collision.stl"/></geometry>
+      <material name="base_color"><color rgba="1 1 1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/base_collision.stl"/></geometry>
+    </collision>
+  </link>
+  <link name="link1">
+    <inertial>
+      <origin xyz="0.00003538 -0.0000718 0.04801679" rpy="0 0 0"/>
+      <mass value="0.41400874"/>
+      <inertia ixx="0.0002321" ixy="3.1e-7" ixz="7e-8" iyy="0.00020922" iyz="-9e-8" izz="0.00018913"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link1_collision.stl"/></geometry>
+      <material name="link1_color"><color rgba="1 1 1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link1_collision.stl"/></geometry>
+    </collision>
+  </link>
+  <link name="link2">
+    <inertial>
+      <origin xyz="-0.19714328 0.02657002 0.00032055" rpy="0 0 0"/>
+      <mass value="0.47570874"/>
+      <inertia ixx="0.00022693" ixy="0.00004893" ixz="0.00001398" iyy="0.00371175" iyz="-1.1e-7" izz="0.00374776"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link2_collision.stl"/></geometry>
+      <material name="link2_color"><color rgba="0.79215686 0.81960784 0.93333333 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link2_collision.stl"/></geometry>
+    </collision>
+  </link>
+  <link name="link3">
+    <inertial>
+      <origin xyz="0.1651649 0.02270821 0.05318555" rpy="0 0 0"/>
+      <mass value="0.32789237"/>
+      <inertia ixx="0.00036749" ixy="-0.00006783" ixz="0.00064566" iyy="0.00412989" iyz="-0.00002073" izz="0.00398948"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link3_collision.stl"/></geometry>
+      <material name="link3_color"><color rgba="0.10980392 0.10980392 0.10980392 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link3_collision.stl"/></geometry>
+    </collision>
+  </link>
+  <link name="link4">
+    <inertial>
+      <origin xyz="0.0651087 0.02590824 0.04330766" rpy="0 0 0"/>
+      <mass value="0.1718"/>
+      <inertia ixx="0.00006639" ixy="0.00000407" ixz="0.00002936" iyy="0.00010706" iyz="0.0000025" izz="0.00009881"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link4_collision.stl"/></geometry>
+      <material name="link4_color"><color rgba="1 1 1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link4_collision.stl"/></geometry>
+    </collision>
+  </link>
+  <link name="link5">
+    <inertial>
+      <origin xyz="-0.00402778 -0.00058728 -0.03553932" rpy="0 0 0"/>
+      <mass value="0.175"/>
+      <inertia ixx="0.00006362" ixy="-4.6e-7" ixz="0.00001137" iyy="0.00007156" iyz="-9e-8" izz="0.0000536"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link5_collision.stl"/></geometry>
+      <material name="link5_color"><color rgba="1 1 1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link5_collision.stl"/></geometry>
+    </collision>
+  </link>
+  <link name="link6">
+    <inertial>
+      <origin xyz="0.0338251 -0.00006571 -0.00002222" rpy="0 0 0"/>
+      <mass value="0.1815"/>
+      <inertia ixx="0.00005772" ixy="1.5e-7" ixz="6e-8" iyy="0.00005864" iyz="3.2e-7" izz="0.00006648"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link6_collision.stl"/></geometry>
+      <material name="link6_color"><color rgba="0.2 0.2 0.2 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://damiao_arm_bringup/meshes/link6_collision.stl"/></geometry>
+    </collision>
+  </link>
+  <joint name="joint1" type="revolute">
+    <parent link="base"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.063" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 -0.0261 0.051" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="-0.25 0.0036 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="0.24996607 -0.0046 0.06529697" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="5" velocity="3"/>
+  </joint>
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0.07049701 0.02634411 0.02772414" rpy="0 0 0"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-3.14" upper="3.14" effort="5" velocity="3"/>
+  </joint>
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0.0179 -0.00077112 -0.03464431" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.14" upper="3.14" effort="5" velocity="3"/>
+  </joint>
+</robot>

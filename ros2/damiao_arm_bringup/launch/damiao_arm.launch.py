@@ -80,18 +80,34 @@ def _launch_setup(context, *args, **kwargs):
         )
     )
 
-    return [robot_state_pub, control_node, jsb_spawner, delay_arm_after_jsb]
+    rviz = Node(
+        package="rviz2",
+        executable="rviz2",
+        arguments=["-d", LaunchConfiguration("rviz_config")],
+        parameters=[robot_description_param],
+        condition=IfCondition(LaunchConfiguration("start_rviz")),
+        output="screen",
+    )
+
+    return [robot_state_pub, control_node, jsb_spawner, delay_arm_after_jsb, rviz]
 
 
 def generate_launch_description():
     declared_args = [
+        DeclareLaunchArgument("start_rviz", default_value="false"),
+        DeclareLaunchArgument(
+            "rviz_config",
+            default_value=os.path.join(
+                get_package_share_directory("damiao_arm_bringup"), "rviz", "damiao_arm.rviz"
+            ),
+        ),
         DeclareLaunchArgument("use_fake_hardware", default_value="false"),
         DeclareLaunchArgument("can_interface", default_value="vcan0"),
         DeclareLaunchArgument("enable_fd", default_value="false"),
-        DeclareLaunchArgument("has_gripper", default_value="true"),
+        DeclareLaunchArgument("has_gripper", default_value="false"),
         DeclareLaunchArgument("state_timeout_ms", default_value="500"),
         DeclareLaunchArgument("command_timeout_ms", default_value="100"),
-        DeclareLaunchArgument("motor_timeout_reg", default_value="0"),
+        DeclareLaunchArgument("motor_timeout_reg", default_value="2000"),
         DeclareLaunchArgument("use_usb_bridge", default_value="false"),
         DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
         DeclareLaunchArgument("baudrate", default_value="921600"),

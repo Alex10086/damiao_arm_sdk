@@ -37,6 +37,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(openarm_single_motor_test examples/openarm_single_motor_test.cpp)
     target_link_libraries(openarm_single_motor_test PRIVATE damiao_arm_sdk)
 
+    # Read-only manual teaching; never energizes or disables motors.
+    add_executable(calibrate_joint_limits examples/calibrate_joint_limits.cpp)
+    target_link_libraries(calibrate_joint_limits PRIVATE damiao_arm_sdk)
+
     # Unit & vcan0/pty integration tests
     enable_testing()
     add_executable(test_sdk tests/test_sdk.cpp)

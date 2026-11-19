@@ -3,10 +3,10 @@
   <xacro:arg name="use_fake_hardware" default="false"/>
   <xacro:arg name="can_interface" default="vcan0"/>
   <xacro:arg name="enable_fd" default="false"/>
-  <xacro:arg name="has_gripper" default="true"/>
+  <xacro:arg name="has_gripper" default="false"/>
   <xacro:arg name="state_timeout_ms" default="500"/>
   <xacro:arg name="command_timeout_ms" default="100"/>
-  <xacro:arg name="motor_timeout_reg" default="0"/>
+  <xacro:arg name="motor_timeout_reg" default="2000"/>
   <xacro:arg name="use_usb_bridge" default="false"/>
   <xacro:arg name="serial_port" default="/dev/ttyACM0"/>
   <xacro:arg name="baudrate" default="921600"/>
@@ -22,77 +22,18 @@
     <child link="base_link"/>
   </joint>
 
-  <link name="base_link">
-    <visual>
-      <geometry><cylinder length="0.06" radius="0.05"/></geometry>
-    </visual>
-  </link>
-
-  <xacro:macro name="arm_link" params="name length:=0.18 radius:=0.03">
-    <link name="${name}">
-      <visual>
-        <origin xyz="0 0 ${length/2.0}" rpy="0 0 0"/>
-        <geometry><cylinder length="${length}" radius="${radius}"/></geometry>
-      </visual>
-    </link>
-  </xacro:macro>
-
-  <xacro:arm_link name="link1" length="0.12"/>
-  <xacro:arm_link name="link2" length="0.22"/>
-  <xacro:arm_link name="link3" length="0.20"/>
-  <xacro:arm_link name="link4" length="0.10"/>
-  <xacro:arm_link name="link5" length="0.08"/>
-  <xacro:arm_link name="link6" length="0.06"/>
-
-  <joint name="joint1" type="revolute">
+  <link name="base_link"/>
+  <joint name="base_model_fixed" type="fixed">
     <parent link="base_link"/>
-    <child link="link1"/>
-    <origin xyz="0 0 0.06" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-3.1416" upper="3.1416" effort="10.0" velocity="30.0"/>
+    <child link="base"/>
   </joint>
 
-  <joint name="joint2" type="revolute">
-    <parent link="link1"/>
-    <child link="link2"/>
-    <origin xyz="0 0 0.12" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-3.1416" upper="3.1416" effort="10.0" velocity="30.0"/>
-  </joint>
-
-  <joint name="joint3" type="revolute">
-    <parent link="link2"/>
-    <child link="link3"/>
-    <origin xyz="0 0 0.22" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-3.1416" upper="3.1416" effort="10.0" velocity="30.0"/>
-  </joint>
-
-  <joint name="joint4" type="revolute">
-    <parent link="link3"/>
-    <child link="link4"/>
-    <origin xyz="0 0 0.20" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-3.1416" upper="3.1416" effort="10.0" velocity="30.0"/>
-  </joint>
-
-  <joint name="joint5" type="revolute">
-    <parent link="link4"/>
-    <child link="link5"/>
-    <origin xyz="0 0 0.10" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-3.1416" upper="3.1416" effort="10.0" velocity="30.0"/>
-  </joint>
-
-  <joint name="joint6" type="revolute">
-    <parent link="link5"/>
-    <child link="link6"/>
-    <origin xyz="0 0 0.08" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-3.1416" upper="3.1416" effort="10.0" velocity="30.0"/>
-  </joint>
+  <!-- CAD limits are not calibrated mechanical limits.
+       Verify each real joint axis and motor polarity before hardware control. -->
+  <xacro:include filename="arm_geometry.urdf"/>
 
   <xacro:if value="$(arg has_gripper)">
+    <!-- Placeholder geometry only; no CAD gripper model has been supplied. -->
     <link name="gripper_link">
       <visual>
         <origin xyz="0 0 0.03" rpy="0 0 0"/>
@@ -108,13 +49,15 @@
     </joint>
   </xacro:if>
 
-  <xacro:macro name="ros2_control_joint" params="name send_id recv_id motor_type:=DM4310">
+  <xacro:macro name="ros2_control_joint" params="name send_id recv_id motor_type:=DM4310 vel_max:=3.0 tau_max:=10.0 pos_min:=-3.14 pos_max:=3.14">
     <joint name="${name}">
       <param name="motor_type">${motor_type}</param>
       <param name="send_can_id">${send_id}</param>
       <param name="recv_can_id">${recv_id}</param>
-      <param name="pos_min">-3.1416</param>
-      <param name="pos_max">3.1416</param>
+      <param name="pos_min">${pos_min}</param>
+      <param name="pos_max">${pos_max}</param>
+      <param name="vel_max">${vel_max}</param>
+      <param name="tau_max">${tau_max}</param>
       <command_interface name="position"/>
       <command_interface name="velocity"/>
       <command_interface name="effort"/>
@@ -161,11 +104,11 @@
     <xacro:ros2_control_joint name="joint1" send_id="0x01" recv_id="0x11"/>
     <xacro:ros2_control_joint name="joint2" send_id="0x02" recv_id="0x12"/>
     <xacro:ros2_control_joint name="joint3" send_id="0x03" recv_id="0x13"/>
-    <xacro:ros2_control_joint name="joint4" send_id="0x04" recv_id="0x14"/>
-    <xacro:ros2_control_joint name="joint5" send_id="0x05" recv_id="0x15"/>
-    <xacro:ros2_control_joint name="joint6" send_id="0x06" recv_id="0x16"/>
+    <xacro:ros2_control_joint name="joint4" send_id="0x04" recv_id="0x14" motor_type="DM3507" tau_max="5.0"/>
+    <xacro:ros2_control_joint name="joint5" send_id="0x05" recv_id="0x15" motor_type="DM3507" tau_max="5.0"/>
+    <xacro:ros2_control_joint name="joint6" send_id="0x06" recv_id="0x16" motor_type="DM3507" tau_max="5.0"/>
     <xacro:if value="$(arg has_gripper)">
-      <xacro:ros2_control_joint name="gripper_joint" send_id="0x07" recv_id="0x17"/>
+      <xacro:ros2_control_joint name="gripper_joint" send_id="0x07" recv_id="0x17" vel_max="30.0" pos_min="-3.1416" pos_max="3.1416"/>
     </xacro:if>
   </ros2_control>
 </robot>

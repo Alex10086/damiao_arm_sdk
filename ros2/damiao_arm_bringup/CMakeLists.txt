@@ -4,7 +4,7 @@ project(damiao_arm_bringup)
 find_package(ament_cmake REQUIRED)
 
 install(
-  DIRECTORY config launch urdf
+  DIRECTORY config launch urdf meshes rviz
   DESTINATION share/${PROJECT_NAME}
 )
 

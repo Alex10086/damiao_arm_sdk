@@ -1,7 +1,16 @@
 # Damiao 6-Axis Robotic Arm Configuration
+joint_count: 6
+has_gripper: false
+# UNCALIBRATED: all pos_min/pos_max below are provisional defaults,
+# not measured mechanical limits. Manually calibrate before control.
 can_interface: vcan0
 enable_fd: false
 state_timeout_ms: 500
+# Require periodic control writes; read-only refresh queries do not feed the motor watchdog.
+command_timeout_ms: 100
+# RID 9 raw units: 50 us/tick on the verified motors, 2000 ticks = 100 ms.
+# Pure C++ callers must apply this with configureMotorTimeout() while DISARMED.
+motor_timeout_reg: 2000
 recv_timeout_us: 1000
 
 joints:
@@ -42,37 +51,37 @@ joints:
     kd_max: 5.0
 
   - name: joint4
-    motor_type: DM4310
+    motor_type: DM3507
     send_can_id: 0x04
     recv_can_id: 0x14
     control_mode: MIT
     pos_min: -3.1416
     pos_max: 3.1416
-    vel_max: 30.0
-    tau_max: 10.0
+    vel_max: 50.0
+    tau_max: 5.0
     kp_max: 500.0
     kd_max: 5.0
 
   - name: joint5
-    motor_type: DM4310
+    motor_type: DM3507
     send_can_id: 0x05
     recv_can_id: 0x15
     control_mode: MIT
     pos_min: -3.1416
     pos_max: 3.1416
-    vel_max: 30.0
-    tau_max: 10.0
+    vel_max: 50.0
+    tau_max: 5.0
     kp_max: 500.0
     kd_max: 5.0
 
   - name: joint6
-    motor_type: DM4310
+    motor_type: DM3507
     send_can_id: 0x06
     recv_can_id: 0x16
     control_mode: MIT
     pos_min: -3.1416
     pos_max: 3.1416
-    vel_max: 30.0
-    tau_max: 10.0
+    vel_max: 50.0
+    tau_max: 5.0
     kp_max: 500.0
     kd_max: 5.0
